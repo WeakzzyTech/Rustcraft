@@ -1,0 +1,3278 @@
+pub mod components;
+pub mod dimensions;
+pub mod glowing;
+pub mod light;
+pub mod shadow;
+pub mod villager;
+
+use std::collections::HashMap;
+
+use azalea_inventory::ItemStack;
+use azalea_inventory::components::EquipmentSlot;
+use azalea_registry::builtin::EntityKind;
+use dimensions::EntityDimensions;
+use glam::DVec3;
+
+use crate::attribute::AttributeMap;
+use crate::entity::components::{LookDirection, Position};
+use crate::entity::villager::{VillagerKind, VillagerProfession};
+use crate::physics::aabb::Aabb;
+use crate::physics::block_shape::CollisionContext;
+use crate::physics::collision::resolve_collision;
+use crate::position::{BlockPos, ChunkPos};
+use crate::renderer::pipelines::entity_renderer::{
+    ARMOR_SLOTS, ArmorRenderInfo, armor_render_info,
+};
+use crate::world::block::{BlockStateTable, FluidKind};
+use crate::world::chunk::ChunkStore;
+
+/// `Entity.FLAG_ONFIRE` (bit 0) of the shared entity flags byte (index 0).
+const SHARED_FLAG_ON_FIRE: u8 = 0x01;
+/// `Entity.FLAG_GLOWING` (bit 6).
+const SHARED_FLAG_GLOWING: u8 = 0x40;
+/// `Entity.FLAG_INVISIBLE` (bit 5).
+const SHARED_FLAG_INVISIBLE: u8 = 0x20;
+
+/// Whether a shared entity flags byte is on fire, as the client's
+/// `Entity.isOnFire` reads it before fire immunity.
+pub fn shared_flags_on_fire(flags: u8) -> bool {
+    flags & SHARED_FLAG_ON_FIRE != 0
+}
+
+/// Whether a shared entity flags byte is glowing: the server's
+/// `isCurrentlyGlowing`, from the `Glowing` tag or the glowing effect.
+pub fn shared_flags_glowing(flags: u8) -> bool {
+    flags & SHARED_FLAG_GLOWING != 0
+}
+
+/// Whether a shared entity flags byte is invisible (vanilla `isInvisible`).
+pub fn shared_flags_invisible(flags: u8) -> bool {
+    flags & SHARED_FLAG_INVISIBLE != 0
+}
+
+/// A scalar synched-entity-data value, forwarded raw from the wire;
+/// [`EntityStore::apply_entity_data`] gives it meaning per (kind, index).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MetaValue {
+    Bool(bool),
+    Int(i32),
+    Byte(u8),
+    Float(f32),
+    Long(i64),
+}
+
+/// Vanilla `Sniffer.State`, in id order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnifferState {
+    Idling,
+    FeelingHappy,
+    Scenting,
+    Sniffing,
+    Searching,
+    Digging,
+    Rising,
+}
+
+impl SnifferState {
+    /// `ByIdMap.continuous` with `OutOfBoundsStrategy.ZERO`.
+    fn from_id(id: i32) -> Self {
+        match id {
+            1 => Self::FeelingHappy,
+            2 => Self::Scenting,
+            3 => Self::Sniffing,
+            4 => Self::Searching,
+            5 => Self::Digging,
+            6 => Self::Rising,
+            _ => Self::Idling,
+        }
+    }
+
+    /// Whether the state has an `AnimationState`; idling and searching
+    /// start none.
+    fn animated(self) -> bool {
+        !matches!(self, Self::Idling | Self::Searching)
+    }
+
+    /// `Sniffer.canPlayDiggingSound`.
+    pub(crate) fn can_play_digging_sound(self) -> bool {
+        matches!(self, Self::Digging | Self::Searching)
+    }
+}
+
+/// The client half of vanilla `Allay.tick`: its held-item and dance clocks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllayAnim {
+    pub dancing: bool,
+    pub holding_ticks: f32,
+    pub prev_holding_ticks: f32,
+    dancing_ticks: f32,
+    pub spinning_ticks: f32,
+    pub prev_spinning_ticks: f32,
+}
+
+impl AllayAnim {
+    fn tick(&mut self, has_item_in_hand: bool) {
+        self.prev_holding_ticks = self.holding_ticks;
+        let step = if has_item_in_hand { 1.0 } else { -1.0 };
+        self.holding_ticks = (self.holding_ticks + step).clamp(0.0, 5.0);
+        if self.dancing {
+            self.dancing_ticks += 1.0;
+            self.prev_spinning_ticks = self.spinning_ticks;
+            let step = if self.is_spinning() { 1.0 } else { -1.0 };
+            self.spinning_ticks = (self.spinning_ticks + step).clamp(0.0, 15.0);
+        } else {
+            self.dancing_ticks = 0.0;
+            self.spinning_ticks = 0.0;
+            self.prev_spinning_ticks = 0.0;
+        }
+    }
+
+    /// `Allay.isSpinning`.
+    pub fn is_spinning(&self) -> bool {
+        self.dancing_ticks % 55.0 < 15.0
+    }
+}
+
+/// Vanilla `CopperGolem`'s synced weathering and state, and the client
+/// `setupAnimationStates` clocks they drive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CopperGolemAnim {
+    /// `WeatheringCopper.WeatherState` id.
+    pub weather: u32,
+    /// `CopperGolemState` id; 0 is idle.
+    pub state: i32,
+    idle_start_tick: u32,
+    pub idle_anim_start: Option<u32>,
+    /// The interaction state playing, and the tick it started at.
+    pub interaction: Option<(i32, u32)>,
+    /// The idle head spin reached its sound this tick (`playHeadSpinSound`).
+    pub head_spun: bool,
+}
+
+impl CopperGolemAnim {
+    /// `CopperGolem.setupAnimationStates` at `tick`, vanilla's `tickCount`.
+    fn tick(&mut self, tick: u32) {
+        if self.state == 0 {
+            self.interaction = None;
+            if self.idle_start_tick == tick {
+                self.idle_anim_start = Some(tick);
+            } else if self.idle_start_tick == 0 {
+                self.idle_start_tick = tick + fastrand::u32(200..240);
+            }
+            self.head_spun = tick == self.idle_start_tick + 10;
+            if self.head_spun {
+                self.idle_start_tick = 0;
+            }
+        } else {
+            self.head_spun = false;
+            self.idle_anim_start = None;
+            self.idle_start_tick = 0;
+            if self.interaction.map(|(state, _)| state) != Some(self.state) {
+                self.interaction = Some((self.state, tick));
+            }
+        }
+    }
+}
+
+/// Vanilla `BinaryAnimator(10, EasingType.IN_OUT_SINE)`: a tick ramp
+/// toward 10 while active, back to 0 while not, eased on read.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BinaryAnimator {
+    ticks: u8,
+    ticks_old: u8,
+}
+
+impl BinaryAnimator {
+    const LENGTH: u8 = 10;
+
+    fn tick(&mut self, active: bool) {
+        self.ticks_old = self.ticks;
+        if active {
+            self.ticks = (self.ticks + 1).min(Self::LENGTH);
+        } else {
+            self.ticks = self.ticks.saturating_sub(1);
+        }
+    }
+
+    /// `getFactor(partialTicks)`, `Ease.inOutSine` applied.
+    pub fn factor(&self, partial: f32) -> f32 {
+        let old = f32::from(self.ticks_old);
+        let x = (old + partial * (f32::from(self.ticks) - old)) / f32::from(Self::LENGTH);
+        -((std::f32::consts::PI * x).cos() - 1.0) / 2.0
+    }
+}
+
+/// The baby axolotl's `AnimationState`s (vanilla `Axolotl.ALL_ANIMATIONS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BabyAxolotlAnim {
+    Swim,
+    Walk,
+    WalkUnderWater,
+    IdleUnderWater,
+    IdleUnderWaterOnGround,
+    IdleOnGround,
+    PlayDead,
+}
+
+/// Client-side axolotl animation state (vanilla `Axolotl.baseTick`'s
+/// `tickAdultAnimations` / `tickBabyAnimations`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AxolotlSim {
+    pub playing_dead: bool,
+    pub playing_dead_animator: BinaryAnimator,
+    pub in_water_animator: BinaryAnimator,
+    pub on_ground_animator: BinaryAnimator,
+    pub moving_animator: BinaryAnimator,
+    /// The baby's one running animation (`soloAnimation`) and its start tick.
+    pub baby_anim: Option<(BabyAxolotlAnim, u32)>,
+}
+
+impl AxolotlSim {
+    /// `is_moving` is `walkAnimation.isMoving() || xRot != xRotO || yRot !=
+    /// yRotO`; `tick` is the post-increment `tickCount`.
+    fn tick(&mut self, is_baby: bool, in_water: bool, on_ground: bool, is_moving: bool, tick: u32) {
+        if is_baby {
+            self.moving_animator.tick(is_moving);
+            use BabyAxolotlAnim as A;
+            let anim = if self.playing_dead {
+                A::PlayDead
+            } else if is_moving {
+                if in_water && !on_ground {
+                    A::Swim
+                } else if !in_water && on_ground {
+                    A::Walk
+                } else {
+                    A::WalkUnderWater
+                }
+            } else if in_water && !on_ground {
+                A::IdleUnderWater
+            } else if in_water && on_ground {
+                A::IdleUnderWaterOnGround
+            } else {
+                A::IdleOnGround
+            };
+            // `startIfStopped`: a running animation keeps its clock.
+            if self.baby_anim.is_none_or(|(running, _)| running != anim) {
+                self.baby_anim = Some((anim, tick));
+            }
+        } else {
+            // `AxolotlAnimationState`: playing dead, then in water, then on
+            // the ground, else in the air.
+            let dead = self.playing_dead;
+            self.playing_dead_animator.tick(dead);
+            self.in_water_animator.tick(!dead && in_water);
+            self.on_ground_animator
+                .tick(!dead && !in_water && on_ground);
+            self.moving_animator.tick(is_moving);
+        }
+    }
+}
+
+/// Vanilla `Armadillo.ArmadilloState`, in id order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArmadilloState {
+    #[default]
+    Idle,
+    Rolling,
+    Scared,
+    Unrolling,
+}
+
+impl ArmadilloState {
+    /// `ByIdMap.continuous` with `OutOfBoundsStrategy.ZERO`.
+    fn from_id(id: i32) -> Self {
+        match id {
+            1 => Self::Rolling,
+            2 => Self::Scared,
+            3 => Self::Unrolling,
+            _ => Self::Idle,
+        }
+    }
+
+    /// `shouldHideInShell`.
+    fn hides_in_shell(self, ticks_in_state: u64) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Rolling => ticks_in_state > 5,
+            Self::Scared => true,
+            Self::Unrolling => ticks_in_state < 26,
+        }
+    }
+}
+
+/// `ArmadilloState.SCARED.animationDuration()`.
+const ARMADILLO_SCARED_ANIMATION_TICKS: i64 = 50;
+
+/// Vanilla `Fox` client state: the synced flags byte and the crouch spring
+/// (`Fox.tick`). The interested head tilt reuses the wolf's spring.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FoxSim {
+    pub flags: u8,
+    pub crouch_amount: f32,
+    pub crouch_amount_o: f32,
+}
+
+impl FoxSim {
+    pub fn is_crouching(&self) -> bool {
+        self.flags & 4 != 0
+    }
+    pub fn is_pouncing(&self) -> bool {
+        self.flags & 16 != 0
+    }
+    pub fn is_sleeping(&self) -> bool {
+        self.flags & 32 != 0
+    }
+    pub fn is_faceplanted(&self) -> bool {
+        self.flags & 64 != 0
+    }
+
+    /// The crouch half of `Fox.tick`.
+    fn tick(&mut self) {
+        self.crouch_amount_o = self.crouch_amount;
+        if self.is_crouching() {
+            self.crouch_amount = (self.crouch_amount + 0.2).min(5.0);
+        } else {
+            self.crouch_amount = 0.0;
+        }
+    }
+}
+
+/// Vanilla `Bee` client state: the synced flags byte and its roll spring.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BeeSim {
+    pub flags: u8,
+    pub roll_amount: f32,
+    pub prev_roll_amount: f32,
+}
+
+impl BeeSim {
+    pub fn is_rolling(&self) -> bool {
+        self.flags & 0x02 != 0
+    }
+    pub fn has_stung(&self) -> bool {
+        self.flags & 0x04 != 0
+    }
+    pub fn has_nectar(&self) -> bool {
+        self.flags & 0x08 != 0
+    }
+
+    /// `Bee.updateRollAmount`.
+    fn tick(&mut self) {
+        self.prev_roll_amount = self.roll_amount;
+        self.roll_amount = spring(self.roll_amount, self.is_rolling(), 0.2, 0.24);
+    }
+}
+
+/// Vanilla `Panda` client state: the synced counters, genes and flags, which
+/// `Panda.tick` also advances client-side, plus its sit / on-back / roll
+/// springs and roll counter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PandaSim {
+    pub sneeze_counter: i32,
+    pub eat_counter: i32,
+    pub main_gene: u8,
+    pub hidden_gene: u8,
+    pub flags: u8,
+    pub roll_counter: i32,
+    pub sit_amount: f32,
+    pub sit_amount_o: f32,
+    pub on_back_amount: f32,
+    pub on_back_amount_o: f32,
+    pub roll_amount: f32,
+    pub roll_amount_o: f32,
+    /// `isScared()` as of the last tick (worried and thundering).
+    pub is_scared: bool,
+    /// The last tick's `addEatingParticles` fired (eating, counter % 5).
+    pub eat_particles: bool,
+}
+
+impl PandaSim {
+    pub const WORRIED: u32 = 2;
+
+    /// `Gene.byId` (signed byte, out of range = NORMAL).
+    fn gene(id: u8) -> u32 {
+        match id as i8 {
+            g @ 0..=6 => g as u32,
+            _ => 0,
+        }
+    }
+
+    /// `Gene.getVariantFromGenes`: a recessive main gene (brown, weak) only
+    /// shows when the hidden gene matches.
+    pub fn variant(&self) -> u32 {
+        let (main, hidden) = (Self::gene(self.main_gene), Self::gene(self.hidden_gene));
+        if matches!(main, 4 | 5) && main != hidden {
+            0
+        } else {
+            main
+        }
+    }
+
+    pub fn is_sneezing(&self) -> bool {
+        self.flags & 2 != 0
+    }
+    pub fn is_rolling(&self) -> bool {
+        self.flags & 4 != 0
+    }
+    pub fn is_sitting(&self) -> bool {
+        self.flags & 8 != 0
+    }
+    pub fn is_on_back(&self) -> bool {
+        self.flags & 16 != 0
+    }
+    pub fn is_eating(&self) -> bool {
+        self.eat_counter > 0
+    }
+
+    fn set_flag(&mut self, flag: u8, value: bool) {
+        if value {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
+
+    /// The client-side half of `Panda.tick` after `super.tick()` (the
+    /// unhappy countdown is the shared one in `tick_living`); returns whether
+    /// it zeroes the pitch (`isSitting` -> `setXRot(0)`).
+    // TODO: the `afterSneeze` SNEEZE particle; rustcraft has no sneeze particle
+    // type yet. Its sounds are server broadcasts (a client `playSound` with
+    // no player is a no-op), and its jumps and gift drop are server-side.
+    fn tick(&mut self, thundering: bool, in_water: bool, holding_item: bool) -> bool {
+        let worried = self.variant() == Self::WORRIED;
+        if worried {
+            if thundering && !in_water {
+                self.set_flag(8, true);
+                self.eat_counter = 0;
+            } else if !self.is_eating() {
+                self.set_flag(8, false);
+            }
+        }
+        if self.is_sneezing() {
+            self.sneeze_counter += 1;
+            if self.sneeze_counter > 20 {
+                self.set_flag(2, false);
+                self.sneeze_counter = 0;
+            }
+        }
+        if self.is_rolling() {
+            self.roll_counter += 1;
+            if self.roll_counter > 32 {
+                self.set_flag(4, false);
+            }
+        } else {
+            self.roll_counter = 0;
+        }
+        let zero_pitch = self.is_sitting();
+        self.sit_amount_o = self.sit_amount;
+        self.sit_amount = spring(self.sit_amount, self.is_sitting(), 0.15, 0.19);
+        // `handleEating`; stopping after a meal is server-only.
+        self.is_scared = worried && thundering;
+        if !self.is_eating()
+            && self.is_sitting()
+            && !self.is_scared
+            && holding_item
+            && fastrand::u32(0..80) == 1
+        {
+            self.eat_counter = 1;
+        } else if !holding_item || !self.is_sitting() {
+            self.eat_counter = 0;
+        }
+        self.eat_particles = self.is_eating() && self.eat_counter % 5 == 0;
+        if self.is_eating() {
+            self.eat_counter += 1;
+        }
+        self.on_back_amount_o = self.on_back_amount;
+        self.on_back_amount = spring(self.on_back_amount, self.is_on_back(), 0.15, 0.19);
+        self.roll_amount_o = self.roll_amount;
+        self.roll_amount = spring(self.roll_amount, self.is_rolling(), 0.15, 0.19);
+        zero_pitch
+    }
+}
+
+/// The client half of vanilla `Armadillo`: the synced state, the ticks spent
+/// in it, and the start ticks of its three `AnimationState`s.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ArmadilloSim {
+    pub state: ArmadilloState,
+    in_state_ticks: u64,
+    pub roll_out_start: Option<i64>,
+    pub roll_up_start: Option<i64>,
+    pub peek_start: Option<i64>,
+    peek_received: bool,
+}
+
+impl ArmadilloSim {
+    /// `onSyncedDataUpdated`.
+    fn set_state(&mut self, id: i32) {
+        self.state = ArmadilloState::from_id(id);
+        self.in_state_ticks = 0;
+    }
+
+    /// `isScared`.
+    pub fn is_scared(&self) -> bool {
+        self.state != ArmadilloState::Idle
+    }
+
+    /// `shouldHideInShell`.
+    pub fn hiding_in_shell(&self) -> bool {
+        self.state.hides_in_shell(self.in_state_ticks)
+    }
+
+    /// `setupAnimationStates` then `++inStateTicks`, at vanilla's
+    /// post-increment `tickCount`.
+    fn tick(&mut self, tick_count: i64) {
+        use ArmadilloState as S;
+        let (roll_out, roll_up) = (self.state == S::Unrolling, self.state == S::Rolling);
+        for (clock, on) in [
+            (&mut self.roll_out_start, roll_out),
+            (&mut self.roll_up_start, roll_up),
+        ] {
+            if !on {
+                *clock = None;
+            } else if clock.is_none() {
+                *clock = Some(tick_count);
+            }
+        }
+        if self.state != S::Scared {
+            self.peek_start = None;
+        } else {
+            if self.peek_received {
+                self.peek_start = None;
+                self.peek_received = false;
+            }
+            if self.in_state_ticks == 0 {
+                // `start` then `fastForward(animationDuration, 1)`: entering
+                // the state shows the peek's last frame.
+                self.peek_start = Some(tick_count - ARMADILLO_SCARED_ANIMATION_TICKS);
+            } else if self.peek_start.is_none() {
+                self.peek_start = Some(tick_count);
+            }
+        }
+        self.in_state_ticks += 1;
+    }
+}
+
+/// The client half of vanilla `Goat`: horn flags and the ram's head-lowering
+/// counter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GoatSim {
+    pub has_left_horn: bool,
+    pub has_right_horn: bool,
+    lowering_head: bool,
+    lower_head_tick: i32,
+}
+
+impl Default for GoatSim {
+    fn default() -> Self {
+        Self {
+            has_left_horn: true,
+            has_right_horn: true,
+            lowering_head: false,
+            lower_head_tick: 0,
+        }
+    }
+}
+
+impl GoatSim {
+    /// `Goat.aiStep`'s head-lowering counter.
+    fn tick(&mut self) {
+        let step = if self.lowering_head { 1 } else { -2 };
+        self.lower_head_tick = (self.lower_head_tick + step).clamp(0, 20);
+    }
+
+    /// `Goat.getRammingXHeadRot`, radians.
+    pub fn ramming_x_head_rot(&self, is_baby: bool) -> f32 {
+        let max = if is_baby { 52.5 } else { 30.0 };
+        self.lower_head_tick as f32 / 20.0 * max * (std::f32::consts::PI / 180.0)
+    }
+}
+
+/// A 0..1 pose amount stepping `up` toward 1 while `on`, else `down`
+/// toward 0.
+fn spring(cur: f32, on: bool, up: f32, down: f32) -> f32 {
+    if on {
+        (cur + up).min(1.0)
+    } else {
+        (cur - down).max(0.0)
+    }
+}
+
+/// `AgeableMob` descendants on every supported version (Slime joined only
+/// in 26.2, so it's excluded here and special-cased where it matters).
+fn is_ageable_mob(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Pig
+            | EntityKind::Cow
+            | EntityKind::Sheep
+            | EntityKind::Chicken
+            | EntityKind::Villager
+            | EntityKind::Wolf
+            | EntityKind::Cat
+            | EntityKind::Ocelot
+            | EntityKind::Rabbit
+            | EntityKind::Squid
+            | EntityKind::GlowSquid
+            | EntityKind::Sniffer
+            | EntityKind::WanderingTrader
+            | EntityKind::SulfurCube
+            | EntityKind::Mooshroom
+            | EntityKind::Armadillo
+            | EntityKind::Goat
+            | EntityKind::Fox
+            | EntityKind::Panda
+            | EntityKind::Bee
+            | EntityKind::Parrot
+            | EntityKind::Dolphin
+            | EntityKind::Turtle
+            | EntityKind::Axolotl
+            | EntityKind::PolarBear
+    ) || is_equine(&kind)
+        || is_llama(kind)
+}
+
+/// Kinds whose entity-data index 16 is the baby flag: `AgeableMob`
+/// descendants plus the zombie family (which defines its own baby flag at
+/// the same index). NOT baby at 16: Bogged (sheared), Skeleton (stray
+/// conversion), Witch (Raider celebrating), fish (from-bucket).
+fn is_baby_kind(kind: EntityKind) -> bool {
+    is_ageable_mob(kind)
+        || matches!(
+            kind,
+            EntityKind::Slime
+                | EntityKind::Zombie
+                | EntityKind::Husk
+                | EntityKind::Drowned
+                | EntityKind::ZombieVillager
+        )
+}
+
+/// 26.1 (protocol 775) added `AgeableMob`'s age-locked flag at 17, pushing
+/// every subclass index up by one; older wire versions are lifted to the
+/// 26.x numbering so `apply_entity_data` matches one index per field.
+fn normalize_ageable_index(kind: EntityKind, index: u8) -> u8 {
+    normalize_ageable_index_at(kind, index, crate::version::session_protocol())
+}
+
+fn normalize_ageable_index_at(kind: EntityKind, index: u8, protocol: i32) -> u8 {
+    let index = if is_ageable_mob(kind) && index >= 17 && protocol < 775 {
+        index + 1
+    } else {
+        index
+    };
+    // Before 1.21.5 (770) `Turtle.HOME_POS` was synched ahead of the egg
+    // flags (and the travel state after them); it shares 18 with `HAS_EGG`
+    // but never matches as a bool.
+    if kind == EntityKind::Turtle && index >= 19 && protocol < 770 {
+        index - 1
+    } else {
+        index
+    }
+}
+
+/// 1.21.9 (protocol 773) reordered `Avatar`'s synched data: main hand moved
+/// 18 -> 15, pushing absorption to 17, score to 18, and mode customisation
+/// to 16 (the shoulder compounds at 19/20 were dropped; the frame
+/// translator strips them). Older wire versions are lifted to the 26.x
+/// numbering so `apply_entity_data` matches one index per field.
+fn normalize_player_index(kind: EntityKind, index: u8) -> u8 {
+    normalize_player_index_at(kind, index, crate::version::session_protocol())
+}
+
+fn normalize_player_index_at(kind: EntityKind, index: u8, protocol: i32) -> u8 {
+    if kind != EntityKind::Player || protocol > 772 {
+        return index;
+    }
+    match index {
+        15 => 17, // absorption
+        16 => 18, // score
+        17 => 16, // mode customisation
+        18 => 15, // main hand
+        i => i,
+    }
+}
+
+const INTERPOLATION_STEPS: i32 = 3;
+/// Vanilla `LivingEntity.hurtDuration`, never assigned anything but 10.
+pub const HURT_DURATION: u8 = 10;
+/// Vanilla default arm-swing duration in ticks
+/// (`LivingEntity.getCurrentSwingDuration`).
+const SWING_DURATION: u8 = 6;
+
+fn tick_death_time(health: f32, should_tick: bool, death_time: &mut u32) {
+    if health <= 0.0 && should_tick {
+        *death_time = death_time.wrapping_add(1);
+    }
+}
+
+fn within_simulation_distance(entity: Position, player: Position, distance: u32) -> bool {
+    let entity_x = (entity.x.floor() as i32).div_euclid(16);
+    let entity_z = (entity.z.floor() as i32).div_euclid(16);
+    let player_x = (player.x.floor() as i32).div_euclid(16);
+    let player_z = (player.z.floor() as i32).div_euclid(16);
+    entity_x.abs_diff(player_x).max(entity_z.abs_diff(player_z)) <= distance
+}
+
+/// `black`'s slot in `CAT_VARIANT_ORDER`.
+const CAT_DEFAULT_VARIANT: u32 = 1;
+
+#[allow(dead_code)]
+pub struct LivingEntity {
+    pub position: Position,
+    pub prev_position: Position,
+    pub look_dir: LookDirection,
+    pub prev_look_dir: LookDirection,
+    pub head_y_rot_deg: f32,
+    pub prev_head_y_rot_deg: f32,
+    pub body_y_rot_deg: f32,
+    pub prev_body_y_rot_deg: f32,
+    pub entity_type: EntityKind,
+    pub uuid: uuid::Uuid,
+    /// `uuid` for a remote player, the key into the tab list and skin cache.
+    pub player_uuid: Option<uuid::Uuid>,
+    pub walk_anim_pos: f32,
+    pub walk_anim_speed: f32,
+    pub prev_walk_anim_speed: f32,
+    pub is_baby: bool,
+    pub is_crouching: bool,
+    /// Vanilla LivingEntity SLEEPING_POS metadata.
+    pub sleeping_pos: Option<BlockPos>,
+    pub on_ground: bool,
+    pub wool_color: Option<u8>,
+    /// Sheep wool shorn / bogged mushrooms shorn.
+    pub is_sheared: bool,
+    /// Registry/wire variant slot; meaning is per-kind. Holder-backed values
+    /// are pre-resolved to pool indices by the net handler; raw-int kinds are
+    /// normalized in `EntityStore::apply_entity_data`.
+    pub variant: u32,
+    /// Chicken wing-flap state (vanilla `Chicken.aiStep`): `flap` is the
+    /// unbounded wing-cycle phase, `flap_speed` the 0..1 amplitude.
+    pub flap: f32,
+    pub prev_flap: f32,
+    pub flap_speed: f32,
+    pub prev_flap_speed: f32,
+    /// Slime squish spring (vanilla `AbstractCubeMob`): negative = squashed
+    /// on landing, positive = stretched in the air.
+    pub squish: f32,
+    pub prev_squish: f32,
+    pub slime_size: u8,
+    /// Enderman screaming flag — raises the head and jitters the render
+    /// position.
+    pub is_creepy: bool,
+    /// Zombie-family conversion (drowning / villager cure) — body-yaw shake.
+    pub is_converting: bool,
+    /// Tamable (wolf/cat) state from the flags byte.
+    pub is_sitting: bool,
+    pub is_tame: bool,
+    pub is_sprinting: bool,
+    pub is_invisible: bool,
+    pub is_glowing: bool,
+    pub is_on_fire: bool,
+    /// Dye id, wolf/cat collars (vanilla default red).
+    pub collar_color: u8,
+    pub is_interested: bool,
+    /// Vanilla persistent-anger end time; angry while > current game time.
+    pub anger_end_time: i64,
+    /// Metadata health; drives the tame wolf's tail angle.
+    pub health: f32,
+    /// `max_health` attribute (`UpdateAttributes`); sizes the mount heart row.
+    pub max_health: f32,
+    /// `camera_distance` attribute (`UpdateAttributes`); a ridden mount can
+    /// push the third-person camera further out.
+    pub camera_distance: f32,
+    /// Attributes learned from `UpdateAttributes`; per-type suppliers aren't
+    /// modeled yet.
+    pub attributes: AttributeMap,
+    pub interested_angle: f32,
+    pub prev_interested_angle: f32,
+    pub shake_anim: f32,
+    pub prev_shake_anim: f32,
+    pub is_lying: bool,
+    pub relax_state_one: bool,
+    pub lie_down_amount: f32,
+    pub prev_lie_down_amount: f32,
+    pub lie_down_amount_tail: f32,
+    pub prev_lie_down_amount_tail: f32,
+    pub relax_state_one_amount: f32,
+    pub prev_relax_state_one_amount: f32,
+    /// Tick the rabbit hop keyframe clock started at, while hopping.
+    pub hop_anim_start: Option<u32>,
+    /// Equine flag-byte state (grass eating, rearing, open mouth);
+    /// `is_standing` is also the polar bear's `DATA_STANDING_ID`.
+    pub is_eating: bool,
+    pub is_standing: bool,
+    pub is_open_mouth: bool,
+    pub eat_anim: f32,
+    pub prev_eat_anim: f32,
+    /// Equine rear spring (0..1); the polar bear's
+    /// `clientSideStandAnimation` (0..6).
+    pub stand_anim: f32,
+    pub prev_stand_anim: f32,
+    pub mouth_anim: f32,
+    pub prev_mouth_anim: f32,
+    pub has_chest: bool,
+    /// Latest server equipment by slot (`SetEquipment`).
+    pub equipment: HashMap<EquipmentSlot, ItemStack>,
+    /// Indexed like `ARMOR_SLOTS`, refreshed by `set_equipment`.
+    pub armor: [Option<ArmorRenderInfo>; 4],
+    /// Packet-driven velocity (vanilla remote entities never integrate their
+    /// own); feeds the squid body-rotation sim.
+    pub velocity: DVec3,
+    /// Vanilla `wasTouchingWater`, probed per tick for aquatic kinds.
+    pub is_in_water: bool,
+    /// Squid client sim (vanilla `Squid.aiStep`), degrees.
+    pub x_body_rot: f32,
+    pub prev_x_body_rot: f32,
+    pub z_body_rot: f32,
+    pub prev_z_body_rot: f32,
+    pub tentacle_angle: f32,
+    pub prev_tentacle_angle: f32,
+    pub bat_resting: bool,
+    /// Tick the bat's current fly/rest animation started at.
+    pub bat_anim_start: Option<u32>,
+    /// The tick the current state's animation started at.
+    pub sniffer_state: SnifferState,
+    pub sniffer_anim_start: Option<u32>,
+    pub bee: BeeSim,
+    /// `Parrot.partyParrot` and its `jukebox`, set by the jukebox level
+    /// events and cleared in `aiStep`.
+    pub party_parrot: bool,
+    pub jukebox: Option<BlockPos>,
+    /// Playing `SnifferSoundInstance`s, stopped once digging ends.
+    pub sniffer_dig_sounds: Vec<u64>,
+    pub allay: AllayAnim,
+    pub copper_golem: CopperGolemAnim,
+    /// Sulfur cube fuse ticks left, -1 while unprimed (`SulfurCube.fuse`).
+    pub sulfur_fuse: i32,
+    pub fox: FoxSim,
+    pub panda: PandaSim,
+    pub axolotl: AxolotlSim,
+    pub armadillo: ArmadilloSim,
+    pub goat: GoatSim,
+    /// `Turtle.HAS_EGG` / `LAYING_EGG`.
+    pub has_egg: bool,
+    pub laying_egg: bool,
+    pub puff_state: u8,
+    /// Glow squid post-hurt dim timer, synced then decremented client-side.
+    pub dark_ticks: i32,
+    /// Iron golem punch / flower-offer countdowns (entity events 4, 11, 34).
+    pub golem_attack_ticks: u8,
+    pub golem_offer_flower_ticks: u16,
+    pub villager_kind: VillagerKind,
+    pub villager_profession: VillagerProfession,
+    pub villager_level: u32,
+    /// Villager head-shake timer; shakes while > 0 (vanilla unhappy counter,
+    /// synched then decremented client-side each tick like vanilla does).
+    pub unhappy_counter: i32,
+    pub eat_anim_tick: u8,
+    pub prev_eat_anim_tick: u8,
+    pub hurt_time: u8,
+    pub death_time: u32,
+    pub age_in_ticks: u32,
+    pub custom_name: Option<String>,
+    /// Mob is targeting/attacking (metadata mob-flags bit 0x04). Raises
+    /// zombie/skeleton arms.
+    pub aggressive: bool,
+    /// Mob-flags bit 0x01.
+    pub no_ai: bool,
+    /// Creeper charged/powered flag — shows the blue aura overlay.
+    pub powered: bool,
+    /// Arm-swing animation timer, counts down from `SWING_DURATION` to 0
+    /// (driven by the server `Animate` packet). Drives the zombie attack
+    /// swing.
+    pub swing_time: u8,
+    /// Chicken `flapping` decay factor.
+    flapping: f32,
+    target_squish: f32,
+    prev_on_ground: bool,
+    is_shaking: bool,
+    jump_ticks: i32,
+    jump_duration: i32,
+    tail_counter: u8,
+    tentacle_movement: f32,
+    tentacle_speed: f32,
+    rotate_speed: f32,
+    interp_target: Position,
+    interp_look_dir: LookDirection,
+    interp_steps: i32,
+    interp_head_y_rot_deg: f32,
+    interp_head_y_rot_steps: i32,
+}
+
+/// A baby's (width, height) from the adult's: vanilla `BABY_DIMENSIONS`,
+/// explicit or scaled, else the generic half scale.
+pub(crate) fn baby_dimensions(kind: EntityKind, width: f32, height: f32) -> (f32, f32) {
+    let scale = match kind {
+        EntityKind::Squid | EntityKind::GlowSquid => return (0.5, 0.5),
+        EntityKind::Goat => return (0.45, 0.65),
+        EntityKind::Armadillo | EntityKind::Fox => 0.6,
+        // Their `getAgeScale`.
+        EntityKind::Dolphin => 0.65,
+        EntityKind::Turtle => 0.3,
+        _ => 0.5,
+    };
+    (width * scale, height * scale)
+}
+
+pub(crate) fn living_entity_dimensions(entity: &LivingEntity) -> EntityDimensions {
+    let mut dims = EntityDimensions::of(entity.entity_type);
+    // `Sniffer.DIGGING_DIMENSIONS`, then the same age scale.
+    if entity.entity_type == EntityKind::Sniffer && entity.sniffer_state == SnifferState::Digging {
+        dims.height -= 0.4;
+    }
+    if entity.is_baby {
+        (dims.width, dims.height) = baby_dimensions(entity.entity_type, dims.width, dims.height);
+    }
+    dims.height *= entity.stand_height_scale();
+    // TODO: `Goat.getDefaultDimensions` scales by 0.7 in `Pose.LONG_JUMPING`;
+    // rustcraft tracks only the crouching pose.
+    dims
+}
+
+fn living_entity_aabb(entity: &LivingEntity) -> Aabb {
+    let dims = living_entity_dimensions(entity);
+    Aabb::from_center(
+        entity.position.into(),
+        f64::from(dims.width) * 0.5,
+        f64::from(dims.height) * 0.5,
+    )
+}
+
+/// Per-kind `pushEntities` / `doPush` overrides. Team rules, spectators and
+/// shared vehicles are the caller's `pusher_allowed` filter.
+// TODO: once these kinds are modeled: ArmorStand no-ops doPush/pushEntities,
+// Vex ticks with noPhysics (no push), and Warden / Creaking gate the
+// reciprocal impulse in isPushable.
+fn pushes_local_player(entity: &LivingEntity) -> bool {
+    // `Parrot.doPush` skips players.
+    !matches!(entity.entity_type, EntityKind::Bat | EntityKind::Parrot)
+}
+
+/// The pusher's `isPushable`, which gates only the reciprocal impulse.
+// TODO: AbstractHorse.isPushable is `!isVehicle()`; ridden equines aren't
+// tracked.
+fn accepts_reciprocal_push(entity: &LivingEntity) -> bool {
+    is_equine(&entity.entity_type) || is_llama(entity.entity_type) || entity.health > 0.0
+}
+
+/// `Entity.push(Entity)` impulses as (local player, remote entity).
+fn living_push_impulses(local: Position, remote: Position) -> Option<(DVec3, DVec3)> {
+    let mut x = remote.x - local.x;
+    let mut z = remote.z - local.z;
+    let mut distance = x.abs().max(z.abs()); // Mth.absMax
+    if distance < f64::from(0.01_f32) {
+        return None;
+    }
+    distance = distance.sqrt();
+    x /= distance;
+    z /= distance;
+    let scale = (1.0 / distance).min(1.0) * f64::from(0.05_f32);
+    x *= scale;
+    z *= scale;
+    Some((DVec3::new(-x, 0.0, -z), DVec3::new(x, 0.0, z)))
+}
+
+impl LivingEntity {
+    /// Vanilla `LivingEntity.recreateFromPacket`: the head and body both
+    /// start at the packet's head yaw, which `look_dir` carries.
+    pub fn new(
+        entity_type: EntityKind,
+        position: Position,
+        look_dir: LookDirection,
+        uuid: uuid::Uuid,
+    ) -> Self {
+        let y_rot_deg = look_dir.y_rot_deg();
+        let default_health = if entity_type == EntityKind::IronGolem {
+            100.0
+        } else {
+            20.0
+        };
+        Self {
+            position,
+            prev_position: position,
+            look_dir,
+            prev_look_dir: look_dir,
+            head_y_rot_deg: y_rot_deg,
+            prev_head_y_rot_deg: y_rot_deg,
+            body_y_rot_deg: y_rot_deg,
+            prev_body_y_rot_deg: y_rot_deg,
+            entity_type,
+            uuid,
+            player_uuid: (entity_type == EntityKind::Player).then_some(uuid),
+            walk_anim_pos: 0.0,
+            walk_anim_speed: 0.0,
+            prev_walk_anim_speed: 0.0,
+            is_baby: false,
+            is_crouching: false,
+            sleeping_pos: None,
+            // Spawn grounded: on_ground is packet-driven and a stationary
+            // entity gets no movement packet for up to 60 ticks.
+            on_ground: true,
+            wool_color: None,
+            is_sheared: false,
+            // Non-default-only metadata means these may never be synced:
+            // vanilla salmon default is MEDIUM (id 1), and `Cat.DEFAULT_VARIANT`
+            // is BLACK.
+            variant: match entity_type {
+                EntityKind::Salmon => 1,
+                EntityKind::Cat => CAT_DEFAULT_VARIANT,
+                _ => 0,
+            },
+            flap: 0.0,
+            prev_flap: 0.0,
+            flap_speed: 0.0,
+            prev_flap_speed: 0.0,
+            squish: 0.0,
+            prev_squish: 0.0,
+            slime_size: 1,
+            is_creepy: false,
+            is_converting: false,
+            is_sitting: false,
+            is_tame: false,
+            is_sprinting: false,
+            is_invisible: false,
+            is_glowing: false,
+            is_on_fire: false,
+            collar_color: 14,
+            is_interested: false,
+            anger_end_time: -1,
+            // Vanilla constructs at max health; the golem's crack overlay
+            // reads it before the metadata arrives.
+            health: default_health,
+            max_health: default_health,
+            camera_distance: crate::renderer::camera::THIRD_PERSON_DISTANCE,
+            attributes: AttributeMap::default(),
+            interested_angle: 0.0,
+            prev_interested_angle: 0.0,
+            shake_anim: 0.0,
+            prev_shake_anim: 0.0,
+            is_lying: false,
+            relax_state_one: false,
+            lie_down_amount: 0.0,
+            prev_lie_down_amount: 0.0,
+            lie_down_amount_tail: 0.0,
+            prev_lie_down_amount_tail: 0.0,
+            relax_state_one_amount: 0.0,
+            prev_relax_state_one_amount: 0.0,
+            hop_anim_start: None,
+            is_eating: false,
+            is_standing: false,
+            is_open_mouth: false,
+            eat_anim: 0.0,
+            prev_eat_anim: 0.0,
+            stand_anim: 0.0,
+            prev_stand_anim: 0.0,
+            mouth_anim: 0.0,
+            prev_mouth_anim: 0.0,
+            has_chest: false,
+            equipment: HashMap::new(),
+            armor: Default::default(),
+            velocity: DVec3::ZERO,
+            is_in_water: false,
+            x_body_rot: 0.0,
+            prev_x_body_rot: 0.0,
+            z_body_rot: 0.0,
+            prev_z_body_rot: 0.0,
+            tentacle_angle: 0.0,
+            prev_tentacle_angle: 0.0,
+            bat_resting: false,
+            bat_anim_start: None,
+            sniffer_state: SnifferState::Idling,
+            sniffer_anim_start: None,
+            bee: BeeSim::default(),
+            party_parrot: false,
+            jukebox: None,
+            sniffer_dig_sounds: Vec::new(),
+            allay: AllayAnim::default(),
+            copper_golem: CopperGolemAnim::default(),
+            sulfur_fuse: -1,
+            fox: FoxSim::default(),
+            panda: PandaSim::default(),
+            axolotl: AxolotlSim::default(),
+            armadillo: ArmadilloSim::default(),
+            goat: GoatSim::default(),
+            has_egg: false,
+            laying_egg: false,
+            puff_state: 0,
+            dark_ticks: 0,
+            golem_attack_ticks: 0,
+            golem_offer_flower_ticks: 0,
+            villager_kind: VillagerKind::default(),
+            villager_profession: VillagerProfession::default(),
+            villager_level: 0,
+            unhappy_counter: 0,
+            eat_anim_tick: 0,
+            prev_eat_anim_tick: 0,
+            hurt_time: 0,
+            death_time: 0,
+            age_in_ticks: 0,
+            custom_name: None,
+            aggressive: false,
+            no_ai: false,
+            powered: false,
+            swing_time: 0,
+            flapping: 1.0,
+            target_squish: 0.0,
+            // Vanilla `AbstractCubeMob.wasOnGround` starts false; with the
+            // grounded spawn above this reproduces vanilla's first-track
+            // landing squash and skips the airborne-spawn stretch.
+            prev_on_ground: false,
+            is_shaking: false,
+            jump_ticks: 0,
+            jump_duration: 0,
+            tail_counter: 0,
+            tentacle_movement: 0.0,
+            tentacle_speed: 1.0 / (fastrand::f32() + 1.0) * 0.2,
+            rotate_speed: 0.0,
+            interp_target: position,
+            interp_look_dir: look_dir,
+            interp_steps: 0,
+            interp_head_y_rot_deg: y_rot_deg,
+            interp_head_y_rot_steps: 0,
+        }
+    }
+
+    pub fn set_equipment(&mut self, slot: EquipmentSlot, item: ItemStack) {
+        if item.is_present() {
+            self.equipment.insert(slot, item);
+        } else {
+            self.equipment.remove(&slot);
+        }
+        if let Some(i) = ARMOR_SLOTS.iter().position(|&s| s == slot) {
+            self.armor[i] = armor_render_info(self.equipment.get(&slot), slot);
+        }
+    }
+
+    pub fn equipment(&self, slot: EquipmentSlot) -> Option<&ItemStack> {
+        self.equipment.get(&slot)
+    }
+
+    /// Vanilla `getViewYRot` / `getViewXRot`: the rotation between ticks.
+    pub fn view_look(&self, partial_tick: f32) -> LookDirection {
+        let (prev, now) = (self.prev_look_dir, self.look_dir);
+        LookDirection::new(
+            lerp_angle(prev.y_rot_deg(), now.y_rot_deg(), partial_tick),
+            prev.x_rot_deg() + (now.x_rot_deg() - prev.x_rot_deg()) * partial_tick,
+        )
+    }
+
+    fn interpolate_to_pos(&mut self, pos: Position) {
+        self.interp_target = pos;
+        self.interp_steps = INTERPOLATION_STEPS;
+    }
+
+    pub fn tick_interpolation(&mut self) {
+        self.prev_position = self.position;
+        self.prev_look_dir = self.look_dir;
+
+        if self.interp_steps > 0 {
+            let alpha = 1.0 / self.interp_steps as f64;
+            self.position = self.position.lerp(self.interp_target, alpha);
+            let y_rot = lerp_angle(
+                self.look_dir.y_rot_deg(),
+                self.interp_look_dir.y_rot_deg(),
+                1.0 / self.interp_steps as f32,
+            );
+            let x_rot = self.look_dir.x_rot_deg()
+                + (self.interp_look_dir.x_rot_deg() - self.look_dir.x_rot_deg())
+                    / self.interp_steps as f32;
+            self.look_dir = LookDirection::new(y_rot, x_rot);
+            self.interp_steps -= 1;
+        } else {
+            // `LivingEntity.aiStep` for an entity that can't simulate movement.
+            self.velocity *= 0.98;
+        }
+        // `LivingEntity.aiStep` then zeroes tiny components.
+        let v = &mut self.velocity;
+        if self.entity_type == EntityKind::Player {
+            if v.x * v.x + v.z * v.z < 9.0e-6 {
+                v.x = 0.0;
+                v.z = 0.0;
+            }
+        } else {
+            if v.x.abs() < 0.003 {
+                v.x = 0.0;
+            }
+            if v.z.abs() < 0.003 {
+                v.z = 0.0;
+            }
+        }
+        if v.y.abs() < 0.003 {
+            v.y = 0.0;
+        }
+
+        self.prev_head_y_rot_deg = self.head_y_rot_deg;
+        if self.interp_head_y_rot_steps > 0 {
+            self.head_y_rot_deg = lerp_angle(
+                self.head_y_rot_deg,
+                self.interp_head_y_rot_deg,
+                1.0 / self.interp_head_y_rot_steps as f32,
+            );
+            self.interp_head_y_rot_steps -= 1;
+        }
+
+        self.prev_body_y_rot_deg = self.body_y_rot_deg;
+    }
+
+    /// Arm-swing progress 0..1 for the current frame. `swing_time` counts down,
+    /// so progress rises 0→1 over the swing; idle clamps to 1 (where the
+    /// attack pose contribution is zero, like vanilla's attackTime
+    /// endpoints).
+    pub fn swing_progress(&self, partial: f32) -> f32 {
+        ((SWING_DURATION as f32 - self.swing_time as f32 + partial) / SWING_DURATION as f32)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Vanilla `getEyePosition(partialTick)`, at the standing eye height.
+    pub fn eye_position(&self, partial: f32) -> Position {
+        let eye = crate::renderer::pipelines::entity_renderer::standing_eye_height(
+            self.entity_type,
+            self.is_baby,
+        );
+        self.prev_position.lerp(self.position, f64::from(partial))
+            + DVec3::new(0.0, f64::from(eye * self.stand_height_scale()), 0.0)
+    }
+
+    /// The wolf / fox interested tilt between ticks, before its
+    /// `getHeadRollAngle` scale.
+    pub fn interested_angle(&self, partial: f32) -> f32 {
+        crate::renderer::entity_model::lerp(
+            partial,
+            self.prev_interested_angle,
+            self.interested_angle,
+        )
+    }
+
+    /// `PolarBear.getDefaultDimensions`' height stretch while standing. Its
+    /// `tick` refreshes the dimensions before stepping the stand counter, so
+    /// they hold the previous value.
+    fn stand_height_scale(&self) -> f32 {
+        if self.entity_type == EntityKind::PolarBear {
+            1.0 + self.prev_stand_anim / 6.0
+        } else {
+            1.0
+        }
+    }
+
+    /// Vanilla `WalkAnimationState.position(partialTick)` (babies run the
+    /// cycle 3x).
+    pub fn walk_pos(&self, partial: f32) -> f32 {
+        let scale = if self.is_baby { 3.0 } else { 1.0 };
+        (self.walk_anim_pos - self.walk_anim_speed * (1.0 - partial)) * scale
+    }
+
+    /// Vanilla `WalkAnimationState.speed(partialTick)`.
+    pub fn walk_speed(&self, partial: f32) -> f32 {
+        (self.prev_walk_anim_speed + (self.walk_anim_speed - self.prev_walk_anim_speed) * partial)
+            .min(1.0)
+    }
+
+    /// The head of vanilla `Parrot.aiStep`: the party ends once the jukebox
+    /// is out of reach or gone.
+    fn tick_party(&mut self, chunks: &ChunkStore, block_state_table: BlockStateTable) {
+        let in_reach = self.jukebox.is_some_and(|pos| {
+            let center = DVec3::new(
+                f64::from(pos.x) + 0.5,
+                f64::from(pos.y) + 0.5,
+                f64::from(pos.z) + 0.5,
+            );
+            DVec3::from(self.position).distance_squared(center) < 3.46 * 3.46
+                && block_state_table
+                    .block_state_data(chunks.get_block_state(pos.x, pos.y, pos.z))
+                    .id()
+                    == "jukebox"
+        });
+        if !in_reach {
+            self.party_parrot = false;
+            self.jukebox = None;
+        }
+    }
+
+    /// Vanilla `Chicken.aiStep` wing flap; the update order matters.
+    fn tick_flap(&mut self) {
+        self.prev_flap = self.flap;
+        self.prev_flap_speed = self.flap_speed;
+        let delta = if self.on_ground { -0.3 } else { 1.2 };
+        self.flap_speed = (self.flap_speed + delta).clamp(0.0, 1.0);
+        if !self.on_ground && self.flapping < 1.0 {
+            self.flapping = 1.0;
+        }
+        self.flapping *= 0.9;
+        self.flap += self.flapping * 2.0;
+    }
+
+    /// Client-side springs for the wolf beg tilt / shake ramp, cat lie-down
+    /// and relax, and the rabbit hop clock (vanilla ticks these on both
+    /// sides; only the driving flags are synced). Inert for other mobs.
+    fn tick_tamable_anims(&mut self) {
+        self.prev_interested_angle = self.interested_angle;
+        self.interested_angle +=
+            (if self.is_interested { 1.0 } else { 0.0 } - self.interested_angle) * 0.4;
+
+        if self.is_shaking {
+            self.prev_shake_anim = self.shake_anim;
+            self.shake_anim += 0.05;
+            if self.prev_shake_anim >= 2.0 {
+                self.is_shaking = false;
+                self.shake_anim = 0.0;
+                self.prev_shake_anim = 0.0;
+            }
+        }
+
+        self.prev_lie_down_amount = self.lie_down_amount;
+        self.lie_down_amount = spring(self.lie_down_amount, self.is_lying, 0.15, 0.22);
+        self.prev_lie_down_amount_tail = self.lie_down_amount_tail;
+        self.lie_down_amount_tail = spring(self.lie_down_amount_tail, self.is_lying, 0.08, 0.13);
+        self.prev_relax_state_one_amount = self.relax_state_one_amount;
+        self.relax_state_one_amount =
+            spring(self.relax_state_one_amount, self.relax_state_one, 0.1, 0.13);
+
+        // Vanilla `Rabbit.setupAnimationStates` (baseTick) then the
+        // `aiStep` jump counter. The clock starts at vanilla's post-increment
+        // tickCount; `age_in_ticks` only increments after this tick body.
+        if self.jump_ticks > 0 {
+            if self.hop_anim_start.is_none() {
+                self.hop_anim_start = Some(self.age_in_ticks + 1);
+            }
+        } else {
+            self.hop_anim_start = None;
+        }
+        if self.jump_ticks != self.jump_duration {
+            self.jump_ticks += 1;
+        } else if self.jump_duration != 0 {
+            self.jump_ticks = 0;
+            self.jump_duration = 0;
+        }
+    }
+
+    /// Vanilla `Wolf.getWetShade` grayscale, with wetness approximated by the
+    /// shake run (rain wetness isn't sampled).
+    // TODO: true isInWaterOrRain wetness for the pre-shake 0.75 darkening.
+    pub fn wet_shade(&self, alpha: f32) -> f32 {
+        if !self.is_shaking {
+            return 1.0;
+        }
+        let shake = self.prev_shake_anim + (self.shake_anim - self.prev_shake_anim) * alpha;
+        (0.75 + shake / 2.0 * 0.25).min(1.0)
+    }
+
+    pub fn tail_swishing(&self) -> bool {
+        self.tail_counter > 0
+    }
+
+    /// Vanilla `AbstractHorse.tick`/`aiStep` springs for the grass-eat,
+    /// rear-up and feeding-mouth animations, plus the client-local tail-swish
+    /// counter. Gated on the equine kinds (the tail RNG isn't free).
+    fn tick_equine_anims(&mut self) {
+        if fastrand::u32(0..200) == 0 {
+            self.tail_counter = 1;
+        }
+        if self.tail_counter > 0 {
+            self.tail_counter += 1;
+            if self.tail_counter > 8 {
+                self.tail_counter = 0;
+            }
+        }
+        self.prev_eat_anim = self.eat_anim;
+        if self.is_eating {
+            self.eat_anim = (self.eat_anim + (1.0 - self.eat_anim) * 0.4 + 0.05).min(1.0);
+        } else {
+            self.eat_anim = (self.eat_anim - self.eat_anim * 0.4 - 0.05).max(0.0);
+        }
+        self.prev_stand_anim = self.stand_anim;
+        if self.is_standing {
+            self.prev_eat_anim = 0.0;
+            self.eat_anim = 0.0;
+            self.stand_anim = (self.stand_anim + (1.0 - self.stand_anim) * 0.4 + 0.05).min(1.0);
+        } else {
+            self.stand_anim = (self.stand_anim
+                + (0.8 * self.stand_anim * self.stand_anim * self.stand_anim - self.stand_anim)
+                    * 0.6
+                - 0.05)
+                .max(0.0);
+        }
+        self.prev_mouth_anim = self.mouth_anim;
+        if self.is_open_mouth {
+            self.mouth_anim = (self.mouth_anim + (1.0 - self.mouth_anim) * 0.7 + 0.05).min(1.0);
+        } else {
+            self.mouth_anim = (self.mouth_anim - self.mouth_anim * 0.7 - 0.05).max(0.0);
+        }
+    }
+
+    /// Vanilla `Entity.updateFluidInteraction`: true when any water column in
+    /// the (slightly deflated) AABB's block range reaches above the box
+    /// bottom. The AABB matches the entity's actual dimensions, including the
+    /// baby-squid override and the salmon/pufferfish variant scale.
+    fn probe_water(&self, chunks: &ChunkStore, block_state_table: BlockStateTable) -> bool {
+        let (w, h): (f64, f64) = match self.entity_type {
+            // `Squid.BABY_DIMENSIONS` is an explicit 0.5x0.5.
+            EntityKind::Squid | EntityKind::GlowSquid if self.is_baby => (0.5, 0.5),
+            EntityKind::Squid | EntityKind::GlowSquid => (0.8, 0.8),
+            EntityKind::Cod => (0.5, 0.3),
+            // `Salmon.getSalmonScale`: small 0.5, medium 1.0, large 1.5.
+            EntityKind::Salmon => {
+                let scale = match self.variant {
+                    0 => 0.5,
+                    2 => 1.5,
+                    _ => 1.0,
+                };
+                (0.7 * scale, 0.4 * scale)
+            }
+            EntityKind::TropicalFish => (0.5, 0.4),
+            // `Pufferfish.getScale`: states 0/1/2 = 0.5/0.7/1.0.
+            EntityKind::Pufferfish => {
+                let scale = match self.puff_state {
+                    0 => 0.5,
+                    1 => 0.7,
+                    _ => 1.0,
+                };
+                (0.7 * scale, 0.7 * scale)
+            }
+            _ => (0.6, 0.6),
+        };
+        let min_x = self.position.x - w / 2.0 + 0.001;
+        let min_y = self.position.y + 0.001;
+        let min_z = self.position.z - w / 2.0 + 0.001;
+        let max_x = self.position.x + w / 2.0 - 0.001;
+        let max_y = self.position.y + h - 0.001;
+        let max_z = self.position.z + w / 2.0 - 0.001;
+        for bx in (min_x.floor() as i32)..=(max_x.ceil() as i32 - 1) {
+            for by in (min_y.floor() as i32)..=(max_y.ceil() as i32 - 1) {
+                for bz in (min_z.floor() as i32)..=(max_z.ceil() as i32 - 1) {
+                    let f = block_state_table
+                        .block_state_data(chunks.get_block_state(bx, by, bz))
+                        .fluid();
+                    if f.kind != FluidKind::Water {
+                        continue;
+                    }
+                    // Full height when the block above is also water.
+                    let above = block_state_table
+                        .block_state_data(chunks.get_block_state(bx, by + 1, bz))
+                        .fluid();
+                    let top = by as f64
+                        + if above.kind == FluidKind::Water {
+                            1.0
+                        } else {
+                            f.height() as f64
+                        };
+                    if top >= min_y {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Vanilla `Squid.aiStep` body/tentacle sim. The tentacle stroke clock
+    /// clamps at 2*pi on the client and only entity event 19 resets it; the
+    /// body yaw and pitch follow the packet-driven velocity (vanilla steers
+    /// remote squids client-side too, overriding the synced yaw).
+    fn tick_squid(&mut self) {
+        use std::f32::consts::PI;
+        self.prev_x_body_rot = self.x_body_rot;
+        self.prev_z_body_rot = self.z_body_rot;
+        self.prev_tentacle_angle = self.tentacle_angle;
+        self.tentacle_movement += self.tentacle_speed;
+        if self.tentacle_movement > PI * 2.0 {
+            self.tentacle_movement = PI * 2.0;
+        }
+        if self.is_in_water {
+            if self.tentacle_movement < PI {
+                let scale = self.tentacle_movement / PI;
+                self.tentacle_angle = (scale * scale * PI).sin() * PI * 0.25;
+                if scale > 0.75 {
+                    self.rotate_speed = 1.0;
+                } else {
+                    self.rotate_speed *= 0.8;
+                }
+            } else {
+                self.tentacle_angle = 0.0;
+                self.rotate_speed *= 0.99;
+            }
+            let v = self.velocity;
+            let horiz = (v.x * v.x + v.z * v.z).sqrt();
+            self.body_y_rot_deg +=
+                (-(v.x.atan2(v.z) as f32).to_degrees() - self.body_y_rot_deg) * 0.1;
+            self.z_body_rot += PI * self.rotate_speed * 1.5;
+            self.x_body_rot += (-(horiz.atan2(v.y) as f32).to_degrees() - self.x_body_rot) * 0.1;
+        } else {
+            self.tentacle_angle = self.tentacle_movement.sin().abs() * PI * 0.25;
+            self.x_body_rot += (-90.0 - self.x_body_rot) * 0.02;
+        }
+    }
+
+    /// Vanilla `AbstractCubeMob.tick` squish spring; the update order matters.
+    fn tick_squish(&mut self) {
+        self.prev_squish = self.squish;
+        self.squish += (self.target_squish - self.squish) * 0.5;
+        if self.on_ground && !self.prev_on_ground {
+            self.target_squish = -0.5;
+        } else if !self.on_ground && self.prev_on_ground {
+            self.target_squish = 1.0;
+        }
+        self.prev_on_ground = self.on_ground;
+        self.target_squish *= 0.6;
+    }
+
+    /// Per-kind per-tick animation state (the kind-specific tail of vanilla
+    /// `aiStep`); arms accrue as mobs land.
+    fn tick_kind_anims(&mut self) {
+        match self.entity_type {
+            // `Parrot.calculateFlapping` is the chicken's flap, but it also
+            // folds while a passenger. TODO: passengers (no client-side
+            // vehicle tracking for other entities yet).
+            EntityKind::Chicken | EntityKind::Parrot => self.tick_flap(),
+            // TODO: `Bee.tick`'s falling-nectar drip particles (no drip
+            // particle type yet).
+            EntityKind::Bee => self.bee.tick(),
+            // `Armadillo.tick`; a scared armadillo's `getMaxHeadYRot` is 0,
+            // so `clampHeadRotationToBody` pins the head to the body.
+            EntityKind::Armadillo => {
+                self.armadillo.tick(i64::from(self.age_in_ticks) + 1);
+                if self.armadillo.is_scared() {
+                    self.head_y_rot_deg += wrap_degrees(self.body_y_rot_deg - self.head_y_rot_deg);
+                }
+            }
+            EntityKind::Goat => self.goat.tick(),
+            EntityKind::Fox => self.fox.tick(),
+            // `Axolotl.baseTick` runs before the interpolation step, where a
+            // remote entity's rotation still equals the `setOldPosAndRot`
+            // copy, so only the walk speed (its pre-update value) can move it.
+            EntityKind::Axolotl => self.axolotl.tick(
+                self.is_baby,
+                self.is_in_water,
+                self.on_ground,
+                self.prev_walk_anim_speed > 1.0e-5,
+                self.age_in_ticks + 1,
+            ),
+            // `PolarBear.tick`: `clientSideStandAnimation`, 0..6.
+            EntityKind::PolarBear => {
+                self.prev_stand_anim = self.stand_anim;
+                let step = if self.is_standing { 1.0 } else { -1.0 };
+                self.stand_anim = (self.stand_anim + step).clamp(0.0, 6.0);
+            }
+            EntityKind::Slime => self.tick_squish(),
+            EntityKind::SulfurCube => {
+                if self.sulfur_fuse > 0 {
+                    self.sulfur_fuse -= 1;
+                }
+                self.tick_squish();
+            }
+            // `Allay.hasItemInHand` checks only the main hand.
+            EntityKind::Allay => {
+                let in_hand = self.equipment(EquipmentSlot::Mainhand).is_some();
+                self.allay.tick(in_hand);
+            }
+            // Vanilla's `tickCount` here is one past the age.
+            EntityKind::CopperGolem if !self.no_ai => self.copper_golem.tick(self.age_in_ticks + 1),
+            EntityKind::CopperGolem => self.copper_golem.head_spun = false,
+            EntityKind::Squid | EntityKind::GlowSquid => {
+                self.tick_squid();
+                if self.dark_ticks > 0 {
+                    self.dark_ticks -= 1;
+                }
+            }
+            // One animation clock, restarted whenever the resting flag
+            // flips (the setter restarts it); vanilla starts it at the
+            // post-increment tickCount.
+            EntityKind::Bat if self.bat_anim_start.is_none() => {
+                self.bat_anim_start = Some(self.age_in_ticks + 1);
+            }
+            k if is_equine(&k) => self.tick_equine_anims(),
+            EntityKind::IronGolem => {
+                self.golem_attack_ticks = self.golem_attack_ticks.saturating_sub(1);
+                self.golem_offer_flower_ticks = self.golem_offer_flower_ticks.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Vanilla `LivingEntity.tickHeadTurn`.
+    // TODO: a `Mob` turns its body through `BodyRotationControl.clientTick`
+    // instead: the body snaps to its yaw while moving, follows the head past
+    // `getMaxHeadYRot` (75 by default, 15 for a goat, 1 for an axolotl), and
+    // turns to face the head after it holds still for 10 ticks.
+    pub fn tick_body_rotation(&mut self) {
+        let dx = self.position.x - self.prev_position.x;
+        let dz = self.position.z - self.prev_position.z;
+        let dist_sq = (dx * dx + dz * dz) as f32;
+
+        if dist_sq > 0.0025 {
+            let walk_dir = -(dx as f32).atan2(dz as f32).to_degrees();
+            let diff_from_look = wrap_degrees(self.look_dir.y_rot_deg() - walk_dir).abs();
+            let body_target = if diff_from_look > 95.0 && diff_from_look < 265.0 {
+                walk_dir - 180.0
+            } else {
+                walk_dir
+            };
+            let diff = wrap_degrees(body_target - self.body_y_rot_deg);
+            self.body_y_rot_deg += diff * 0.3;
+        }
+
+        let head_diff = wrap_degrees(self.head_y_rot_deg - self.body_y_rot_deg);
+        if head_diff.abs() > 50.0 {
+            self.body_y_rot_deg += head_diff - head_diff.signum() * 50.0;
+        }
+    }
+}
+
+pub struct ItemEntity {
+    /// As a string, its scoreboard name (vanilla `getScoreboardName`), which
+    /// its team colour is keyed by.
+    pub uuid: uuid::Uuid,
+    pub position: Position,
+    pub prev_position: Position,
+    pub item_name: String,
+    /// Registry id (vanilla `Item.getId`) — part of the copy-scatter seed.
+    pub item_id: u32,
+    /// Vanilla `ItemStack.getDamageValue()` — the other seed component.
+    pub damage: i32,
+    pub count: i32,
+    pub stack: Option<azalea_inventory::ItemStackData>,
+    pub age: u32,
+    pub bob_offset: f32,
+    pub is_glowing: bool,
+    velocity: DVec3,
+    on_ground: bool,
+    /// Server-authoritative position, tracked from move/teleport packets.
+    server_pos: Position,
+}
+
+struct PickupAnimation {
+    item_name: String,
+    item_id: u32,
+    damage: i32,
+    count: i32,
+    stack: Option<azalea_inventory::ItemStackData>,
+    start_pos: Position,
+    target_pos: Position,
+    bob_offset: f32,
+    age: u32,
+    life: u32,
+}
+
+pub struct PickupRenderInfo {
+    pub item_name: String,
+    pub item_id: u32,
+    pub damage: i32,
+    pub count: i32,
+    pub stack: Option<azalea_inventory::ItemStackData>,
+    pub position: Position,
+    pub bob_offset: f32,
+    pub age: u32,
+}
+
+const PICKUP_LIFE: u32 = 3;
+
+pub struct ItemEntityStore {
+    items: HashMap<i32, ItemEntity>,
+    pickups: Vec<PickupAnimation>,
+}
+
+impl ItemEntityStore {
+    #[cfg(feature = "test-harness")]
+    pub fn items(&self) -> impl Iterator<Item = (i32, &ItemEntity)> {
+        self.items.iter().map(|(id, item)| (*id, item))
+    }
+
+    pub fn new() -> Self {
+        Self {
+            items: HashMap::new(),
+            pickups: Vec::new(),
+        }
+    }
+
+    pub fn spawn_item(&mut self, id: i32, uuid: uuid::Uuid, position: Position, velocity: DVec3) {
+        let bob_offset =
+            ((id as u32).wrapping_mul(2654435761)) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+        self.items.insert(
+            id,
+            ItemEntity {
+                uuid,
+                position,
+                prev_position: position,
+                item_name: String::new(),
+                item_id: 0,
+                damage: 0,
+                count: 1,
+                stack: None,
+                age: 0,
+                bob_offset,
+                is_glowing: false,
+                velocity,
+                on_ground: false,
+                server_pos: position,
+            },
+        );
+    }
+
+    pub fn set_item_data(
+        &mut self,
+        id: i32,
+        item_name: String,
+        item_id: u32,
+        damage: i32,
+        count: i32,
+        stack: azalea_inventory::ItemStackData,
+    ) {
+        if let Some(entity) = self.items.get_mut(&id) {
+            entity.item_name = item_name;
+            entity.item_id = item_id;
+            entity.damage = damage;
+            entity.count = count;
+            entity.stack = Some(stack);
+        }
+    }
+
+    /// The shared entity flags byte (index 0) of item `id`.
+    pub fn set_shared_flags(&mut self, id: i32, flags: u8) {
+        if let Some(entity) = self.items.get_mut(&id) {
+            entity.is_glowing = shared_flags_glowing(flags);
+        }
+    }
+
+    /// Apply a server position delta: advance the authoritative base and
+    /// snap to it. Items have no interpolation handler in vanilla
+    /// (`moveOrInterpolateTo` -> `setPos`); local physics predicts between
+    /// packets and `prev_position` smooths the render lerp.
+    pub fn move_delta(&mut self, id: i32, dx: f64, dy: f64, dz: f64, on_ground: bool) {
+        if let Some(entity) = self.items.get_mut(&id) {
+            entity.server_pos += DVec3::new(dx, dy, dz);
+            entity.position = entity.server_pos;
+            entity.on_ground = on_ground;
+        }
+    }
+
+    pub fn teleport(
+        &mut self,
+        id: i32,
+        position: Position,
+        velocity: Option<DVec3>,
+        on_ground: bool,
+    ) {
+        if let Some(entity) = self.items.get_mut(&id) {
+            // Vanilla suppresses the render lerp on jumps over 64 blocks
+            // (`tooBigToInterpolate`).
+            if entity.position.distance_squared(*position) > 4096.0 {
+                entity.prev_position = position;
+            }
+            entity.server_pos = position;
+            entity.position = position;
+            if let Some(velocity) = velocity {
+                entity.velocity = velocity;
+            }
+            entity.on_ground = on_ground;
+        }
+    }
+
+    /// Vanilla `handleSetEntityMotion`.
+    pub fn set_motion(&mut self, id: i32, velocity: DVec3) {
+        if let Some(entity) = self.items.get_mut(&id) {
+            entity.velocity = velocity;
+        }
+    }
+
+    /// Handle a take-item packet: animate the (pre-shrink) cluster flying to
+    /// the collector, then shrink the stack by `amount`, removing it only
+    /// when empty (vanilla `handleTakeItemEntity`). Returns the item's
+    /// position for the pickup sound, or `None` if there's nothing to pick
+    /// up.
+    pub fn pickup(&mut self, item_id: i32, target_pos: Position, amount: i32) -> Option<Position> {
+        let entity = self.items.get_mut(&item_id)?;
+        if entity.item_name.is_empty() {
+            return None;
+        }
+        let start_pos = entity.position;
+        let anim = PickupAnimation {
+            item_name: entity.item_name.clone(),
+            item_id: entity.item_id,
+            damage: entity.damage,
+            count: entity.count,
+            stack: entity.stack.clone(),
+            start_pos,
+            target_pos,
+            bob_offset: entity.bob_offset,
+            age: entity.age,
+            life: 0,
+        };
+        entity.count -= amount;
+        let empty = entity.count <= 0;
+        self.pickups.push(anim);
+        if empty {
+            self.items.remove(&item_id);
+        }
+        Some(start_pos)
+    }
+
+    pub fn remove(&mut self, ids: &[i32]) {
+        for &id in ids {
+            self.items.remove(&id);
+        }
+    }
+
+    pub fn tick(
+        &mut self,
+        chunk_store: &ChunkStore,
+        block_state_table: crate::world::block::BlockStateTable,
+    ) {
+        for (&id, entity) in self.items.iter_mut() {
+            entity.prev_position = entity.position;
+            tick_item_physics(id, entity, chunk_store, block_state_table);
+            entity.age += 1;
+        }
+        for pickup in &mut self.pickups {
+            pickup.life += 1;
+        }
+        self.pickups.retain(|p| p.life < PICKUP_LIFE);
+    }
+
+    pub fn visible_items(&self, camera_pos: DVec3, max_dist: f64) -> Vec<&ItemEntity> {
+        let max_dist_sq = max_dist * max_dist;
+        self.items
+            .values()
+            .filter(|e| {
+                !e.item_name.is_empty() && e.position.distance_squared(camera_pos) < max_dist_sq
+            })
+            .collect()
+    }
+
+    pub fn active_pickups(&self, partial_tick: f32) -> Vec<PickupRenderInfo> {
+        self.pickups
+            .iter()
+            .map(|p| {
+                let t = (p.life as f32 + partial_tick) / PICKUP_LIFE as f32;
+                let t = t * t;
+                let pos = p.start_pos.lerp(p.target_pos, t as f64);
+                PickupRenderInfo {
+                    item_name: p.item_name.clone(),
+                    item_id: p.item_id,
+                    damage: p.damage,
+                    count: p.count,
+                    stack: p.stack.clone(),
+                    position: pos,
+                    bob_offset: p.bob_offset,
+                    age: p.age,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Vanilla `ItemEntity.getDefaultGravity`.
+const ITEM_GRAVITY: f64 = 0.04;
+/// Vanilla `Entity.getAirDrag`.
+const ITEM_AIR_DRAG: f64 = 0.98;
+/// Item hitbox is 0.25 cubed (`EntityType.ITEM` dimensions).
+const ITEM_HALF_WIDTH: f64 = 0.125;
+
+/// Client-side port of `ItemEntity.tick` movement: gravity or fluid drift,
+/// collide-and-slide, friction, then the half-speed landing bounce.
+/// Server-only parts (merging, despawn, pickup delay) are omitted.
+fn tick_item_physics(
+    id: i32,
+    entity: &mut ItemEntity,
+    chunk_store: &ChunkStore,
+    block_state_table: crate::world::block::BlockStateTable,
+) {
+    let block_x = entity.position.x.floor() as i32;
+    let block_y = entity.position.y.floor() as i32;
+    let block_z = entity.position.z.floor() as i32;
+    let chunk_pos = ChunkPos::new(block_x.div_euclid(16), block_z.div_euclid(16));
+    if chunk_store.get_chunk(&chunk_pos).is_none() {
+        // Don't simulate (and fall) through unloaded terrain.
+        return;
+    }
+
+    let state = chunk_store.get_block_state(block_x, block_y, block_z);
+    let fluid = block_state_table.block_state_data(state).fluid();
+    // Vanilla `getFluidHeight(...) > 0.1`: how far the fluid surface sits
+    // above the item's feet, sampled at the position block.
+    let fluid_height = block_y as f64 + fluid.height() as f64 - entity.position.y;
+    match fluid.kind {
+        FluidKind::Water if fluid_height > 0.1 => apply_item_fluid_movement(entity, 0.99),
+        FluidKind::Lava if fluid_height > 0.1 => apply_item_fluid_movement(entity, 0.95),
+        _ => entity.velocity.y -= ITEM_GRAVITY,
+    }
+
+    // Vanilla rest throttle: a settled item only re-runs collision every
+    // 4th tick. `age` increments after this runs; vanilla's `tickCount`
+    // increments before, hence the +1.
+    let horizontal_sq =
+        entity.velocity.x * entity.velocity.x + entity.velocity.z * entity.velocity.z;
+    if entity.on_ground && horizontal_sq <= 1e-5 && (entity.age as i64 + 1 + id as i64) % 4 != 0 {
+        return;
+    }
+
+    let aabb = Aabb::from_center(entity.position.into(), ITEM_HALF_WIDTH, ITEM_HALF_WIDTH);
+    let ctx = CollisionContext::entity(entity.position.y, false, false);
+    let (delta, on_ground) = resolve_collision(
+        crate::physics::collision::CollisionWorld::new(chunk_store, block_state_table),
+        aabb,
+        entity.velocity.into(),
+        0.0,
+        entity.on_ground,
+        &ctx,
+    );
+    entity.position += delta;
+    entity.on_ground = on_ground;
+
+    // TODO: per-block slipperiness (ice/slime); vanilla multiplies by the
+    // friction of the block below, default 0.6.
+    let ground_friction = if on_ground {
+        ITEM_AIR_DRAG * 0.6
+    } else {
+        ITEM_AIR_DRAG
+    };
+    entity.velocity.x *= ground_friction;
+    entity.velocity.y *= ITEM_AIR_DRAG;
+    entity.velocity.z *= ground_friction;
+    if on_ground && entity.velocity.y < 0.0 {
+        entity.velocity.y *= -0.5;
+    }
+}
+
+/// Vanilla `ItemEntity.setFluidMovement`: horizontal drag plus a slow
+/// upward drift toward the surface.
+fn apply_item_fluid_movement(entity: &mut ItemEntity, multiplier: f64) {
+    entity.velocity.x *= multiplier;
+    entity.velocity.z *= multiplier;
+    if entity.velocity.y < 0.06 {
+        entity.velocity.y += 5.0e-4;
+    }
+}
+
+pub struct EntityStore {
+    pub living: HashMap<i32, LivingEntity>,
+    /// Vanilla `Level.isThundering`, set by the caller before each tick.
+    pub thundering: bool,
+}
+
+impl EntityStore {
+    pub fn new() -> Self {
+        Self {
+            living: HashMap::new(),
+            thundering: false,
+        }
+    }
+
+    pub fn spawn_living(
+        &mut self,
+        id: i32,
+        entity_type: EntityKind,
+        position: Position,
+        look_dir: LookDirection,
+        uuid: uuid::Uuid,
+    ) {
+        self.living
+            .insert(id, LivingEntity::new(entity_type, position, look_dir, uuid));
+    }
+
+    pub fn move_living_delta(&mut self, id: i32, dx: f64, dy: f64, dz: f64, on_ground: bool) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            let target = entity.interp_target + DVec3::new(dx, dy, dz);
+            entity.interpolate_to_pos(target);
+            entity.on_ground = on_ground;
+        }
+    }
+
+    pub fn teleport_living(&mut self, id: i32, position: Position, on_ground: bool) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.interpolate_to_pos(position);
+            entity.on_ground = on_ground;
+        }
+    }
+
+    /// Apply LivingEntity SLEEPING_POS; `setPosToBed` is a plain `setPos`, so
+    /// the previous position and any interpolation are left alone.
+    pub fn set_sleeping_pos(&mut self, id: i32, pos: Option<BlockPos>) {
+        let Some(entity) = self.living.get_mut(&id) else {
+            return;
+        };
+        entity.sleeping_pos = pos;
+        if let Some(pos) = pos {
+            entity.position = crate::world::block::sleeping_position(pos).into();
+        }
+    }
+
+    /// Resolves a raw synched-entity-data scalar per (kind, index), the
+    /// direct analogue of vanilla's per-class `onSyncedDataUpdated`. Index
+    /// arithmetic follows the registration chain: `Entity` 0-7,
+    /// `LivingEntity` 8-14, `Mob` 15, `AgeableMob` 16 baby + 17 age-locked,
+    /// first subclass field 18, in the 26.x numbering
+    /// (`normalize_ageable_index`).
+    pub fn apply_entity_data(&mut self, id: i32, index: u8, value: MetaValue) {
+        use MetaValue::{Bool, Byte, Float, Int, Long};
+        let Some(entity) = self.living.get_mut(&id) else {
+            return;
+        };
+        let kind = entity.entity_type;
+        let index = normalize_player_index(kind, normalize_ageable_index(kind, index));
+        match (kind, index, value) {
+            // Shared entity flags byte: bit 0x08 = sprinting.
+            (_, 0, Byte(f)) => {
+                entity.is_on_fire = shared_flags_on_fire(f);
+                entity.is_sprinting = f & 0x08 != 0;
+                entity.is_invisible = shared_flags_invisible(f);
+                entity.is_glowing = shared_flags_glowing(f);
+            }
+            (_, 9, Float(h)) => entity.health = h,
+            // Mob flags byte: bit 0x04 = aggressive. Players aren't mobs;
+            // their 15 is Avatar's main hand (a byte on 1.21.9-1.21.10).
+            (k, 15, Byte(f)) if k != EntityKind::Player => {
+                entity.no_ai = f & 0x01 != 0;
+                entity.aggressive = f & 0x04 != 0;
+            }
+            (k, 16, Bool(b)) if is_baby_kind(k) => entity.is_baby = b,
+            // Skeleton: powder-snow stray conversion; drives the vanilla
+            // `isShaking` body jitter.
+            (EntityKind::Skeleton, 16, Bool(b)) => entity.is_converting = b,
+            (EntityKind::Bogged, 16, Bool(b)) => entity.is_sheared = b,
+            // Slime size: 16 on 1.21.9-26.1.x, 18 since Slime joined
+            // AgeableMob in 26.2.
+            (EntityKind::Slime, 16 | 18, Int(s)) | (EntityKind::SulfurCube, 18, Int(s)) => {
+                entity.slime_size = s.clamp(1, 127) as u8
+            }
+            // `SulfurCube.onSyncedDataUpdated` primes the fuse from MAX_FUSE.
+            (EntityKind::SulfurCube, 19, Int(f)) => entity.sulfur_fuse = f,
+            (EntityKind::Allay, 16, Bool(b)) => entity.allay.dancing = b,
+            (EntityKind::CopperGolem, 16, Int(w)) => {
+                entity.copper_golem.weather = w.clamp(0, 3) as u32
+            }
+            (EntityKind::CopperGolem, 17, Int(s)) => {
+                entity.copper_golem.state = if (0..=4).contains(&s) { s } else { 0 }
+            }
+            // Sheep wool byte: low nibble = DyeColor, bit 0x10 = sheared.
+            (EntityKind::Sheep, 18, Byte(w)) => {
+                entity.wool_color = Some(w & 0x0F);
+                entity.is_sheared = w & 0x10 != 0;
+            }
+            (EntityKind::Creeper, 17, Bool(b)) => entity.powered = b,
+            (EntityKind::Enderman, 17, Bool(b)) => entity.is_creepy = b,
+            // Zombie-family underwater conversion / zombie villager curing.
+            (EntityKind::Zombie | EntityKind::Husk | EntityKind::Drowned, 18, Bool(b))
+            | (EntityKind::ZombieVillager, 19, Bool(b)) => entity.is_converting = b,
+            (
+                EntityKind::Villager | EntityKind::WanderingTrader | EntityKind::Panda,
+                18,
+                Int(c),
+            ) => entity.unhappy_counter = c,
+            // `Fox.Variant` id map (ZERO out of range): 0 red, 1 snow.
+            (EntityKind::Fox, 18, Int(v)) => entity.variant = u32::from(v == 1),
+            (EntityKind::Fox, 19, Byte(f)) => {
+                entity.fox.flags = f;
+                entity.is_sitting = f & 0x01 != 0;
+                entity.is_interested = f & 0x08 != 0;
+            }
+            (EntityKind::Panda, 19, Int(c)) => entity.panda.sneeze_counter = c,
+            (EntityKind::Panda, 20, Int(c)) => entity.panda.eat_counter = c,
+            (EntityKind::Panda, 21, Byte(g)) => entity.panda.main_gene = g,
+            (EntityKind::Panda, 22, Byte(g)) => entity.panda.hidden_gene = g,
+            (EntityKind::Panda, 23, Byte(f)) => entity.panda.flags = f,
+            // Vanilla sparse rabbit id map: 99 = evil, unknown ids fall back
+            // to brown.
+            (EntityKind::Rabbit, 18, Int(v)) => {
+                entity.variant = match v {
+                    0..=5 => v as u32,
+                    99 => 6,
+                    _ => 0,
+                }
+            }
+            // Equine flags byte: bit 0x10 = eating, 0x20 = standing (rear),
+            // 0x40 = open mouth.
+            (k, 18, Byte(f)) if is_equine(&k) => {
+                entity.is_eating = f & 0x10 != 0;
+                entity.is_standing = f & 0x20 != 0;
+                entity.is_open_mouth = f & 0x40 != 0;
+            }
+            (EntityKind::Donkey | EntityKind::Mule, 19, Bool(b)) => entity.has_chest = b,
+            (k, 19, Bool(b)) if is_llama(k) => entity.has_chest = b,
+            // `Llama.Variant` and `MushroomCow.Variant` ids clamp (vanilla
+            // `ByIdMap` CLAMP).
+            (k, 21, Int(v)) if is_llama(k) => entity.variant = v.clamp(0, 3) as u32,
+            (EntityKind::Mooshroom, 18, Int(v)) => entity.variant = v.clamp(0, 1) as u32,
+            // Horse packed variant: `color | markings << 8`, both wrapping
+            // their id ranges (vanilla `ByIdMap` WRAP).
+            (EntityKind::Horse, 19, Int(v)) => {
+                let v = v as u32;
+                entity.variant = ((v & 0xFF) % 7) | ((((v >> 8) & 0xFF) % 5) << 8);
+            }
+            // Tamable flags byte: bit 0x01 = sitting, 0x04 = tame.
+            (EntityKind::Wolf | EntityKind::Cat | EntityKind::Parrot, 18, Byte(f)) => {
+                entity.is_sitting = f & 0x01 != 0;
+                entity.is_tame = f & 0x04 != 0;
+            }
+            (EntityKind::Wolf, 20, Bool(b)) => entity.is_interested = b,
+            (EntityKind::Wolf, 21, Int(c)) | (EntityKind::Cat, 23, Int(c)) => {
+                entity.collar_color = c as u8 & 0x0F
+            }
+            (EntityKind::Cat, 21, Bool(b)) => entity.is_lying = b,
+            // Persistent anger: a game-time end tick since 1.21.11; on
+            // 1.21.9-1.21.10 a remaining-tick countdown the server re-syncs
+            // as it decrements, so any positive value means angry.
+            (EntityKind::Wolf, 22, Long(t)) | (EntityKind::Bee, 19, Long(t)) => {
+                entity.anger_end_time = t
+            }
+            (EntityKind::Wolf, 22, Int(t)) | (EntityKind::Bee, 19, Int(t)) => {
+                entity.anger_end_time = if t > 0 { i64::MAX } else { -1 }
+            }
+            (EntityKind::Cat, 22, Bool(b)) => entity.relax_state_one = b,
+            (EntityKind::Bee, 18, Byte(f)) => entity.bee.flags = f,
+            // `Parrot.Variant.BY_ID` clamps out-of-range ids.
+            (EntityKind::Parrot, 20, Int(v)) => entity.variant = v.clamp(0, 4) as u32,
+            // Bat flags byte: bit 0x01 = resting (hanging); a flip restarts
+            // the fly/rest animation clock.
+            (EntityKind::Bat, 16, Byte(f)) => {
+                let resting = f & 0x01 != 0;
+                if entity.bat_resting != resting {
+                    entity.bat_resting = resting;
+                    entity.bat_anim_start = Some(entity.age_in_ticks + 1);
+                }
+            }
+            (EntityKind::Armadillo, 18, Int(id)) => entity.armadillo.set_state(id),
+            (EntityKind::Goat, 19, Bool(b)) => entity.goat.has_left_horn = b,
+            (EntityKind::Goat, 20, Bool(b)) => entity.goat.has_right_horn = b,
+            (EntityKind::Turtle, 18, Bool(b)) => entity.has_egg = b,
+            (EntityKind::Turtle, 19, Bool(b)) => entity.laying_egg = b,
+            // `Axolotl.Variant.byId`: out-of-range ids fall back to LUCY.
+            (EntityKind::Axolotl, 18, Int(v)) => {
+                entity.variant = if (0..=4).contains(&v) { v as u32 } else { 0 }
+            }
+            (EntityKind::Axolotl, 19, Bool(b)) => entity.axolotl.playing_dead = b,
+            (EntityKind::PolarBear, 18, Bool(b)) => entity.is_standing = b,
+            // Salmon size ids clamp to SMALL..LARGE; a pufferfish puff state
+            // outside 0/1 renders big (vanilla `switch` default).
+            // `Sniffer.onSyncedDataUpdated`: every update stops all five
+            // animation states, then starts the new state's one.
+            (EntityKind::Sniffer, 18, Int(id)) => {
+                let state = SnifferState::from_id(id);
+                entity.sniffer_state = state;
+                entity.sniffer_anim_start = state.animated().then_some(entity.age_in_ticks);
+            }
+            (EntityKind::Salmon, 17, Int(v)) => entity.variant = v.clamp(0, 2) as u32,
+            (EntityKind::TropicalFish, 17, Int(v)) => entity.variant = v as u32,
+            (EntityKind::Pufferfish, 17, Int(s)) => {
+                entity.puff_state = if (0..=1).contains(&s) { s as u8 } else { 2 }
+            }
+            (EntityKind::GlowSquid, 18, Int(t)) => entity.dark_ticks = t,
+            _ => {}
+        }
+    }
+
+    pub fn set_crouching(&mut self, id: i32, is_crouching: bool) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.is_crouching = is_crouching;
+        }
+    }
+
+    /// `kind` is the mob the emitting handler arm resolved the value for;
+    /// metadata indices are overloaded across kinds, so a mismatched entity
+    /// ignores the write.
+    pub fn set_variant(&mut self, id: i32, kind: EntityKind, raw: u32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == kind
+        {
+            entity.variant = raw;
+        }
+    }
+
+    pub fn set_villager_data(
+        &mut self,
+        id: i32,
+        kind: VillagerKind,
+        profession: VillagerProfession,
+        level: u32,
+    ) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && matches!(
+                entity.entity_type,
+                EntityKind::Villager | EntityKind::ZombieVillager
+            )
+        {
+            entity.villager_kind = kind;
+            entity.villager_profession = profession;
+            entity.villager_level = level;
+        }
+    }
+
+    pub fn start_sheep_eat(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::Sheep
+        {
+            entity.eat_anim_tick = 40;
+            entity.prev_eat_anim_tick = 40;
+        }
+    }
+
+    pub fn mark_dead(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type != EntityKind::Player
+        {
+            entity.health = 0.0;
+            entity.is_crouching = false;
+        }
+    }
+
+    /// Mirrors vanilla `LivingEntity.handleDamageEvent`: `hurtTime = 10`.
+    pub fn mark_hurt(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.hurt_time = HURT_DURATION;
+        }
+    }
+
+    pub fn set_custom_name(&mut self, id: i32, name: Option<String>) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.custom_name = name;
+        }
+    }
+
+    /// Wolf wet-shake start / cancel (entity events 8 / 56).
+    pub fn set_wolf_shaking(&mut self, id: i32, shaking: bool) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::Wolf
+        {
+            entity.is_shaking = shaking;
+            entity.shake_anim = 0.0;
+            entity.prev_shake_anim = 0.0;
+        }
+    }
+
+    /// Rabbit hop (entity event 1): vanilla sets a 15-tick jump run.
+    pub fn start_rabbit_jump(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::Rabbit
+        {
+            entity.jump_duration = 15;
+            entity.jump_ticks = 0;
+        }
+    }
+
+    /// Vanilla `LevelEventHandler.notifyNearbyEntities`: every living
+    /// entity touching the jukebox's box grown by 3 hears it start or stop
+    /// (only parrots react, `Parrot.setRecordPlayingNearby`).
+    pub fn set_record_playing_nearby(&mut self, pos: BlockPos, is_playing: bool) {
+        let b = Aabb::block(pos.x, pos.y, pos.z);
+        let area = Aabb::new(b.min - DVec3::splat(3.0), b.max + DVec3::splat(3.0));
+        for entity in self.living.values_mut() {
+            if entity.entity_type == EntityKind::Parrot
+                && living_entity_aabb(entity).intersects(&area)
+            {
+                entity.jukebox = Some(pos);
+                entity.party_parrot = is_playing;
+            }
+        }
+    }
+
+    pub fn set_living_motion(&mut self, id: i32, velocity: DVec3) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.velocity = velocity;
+        }
+    }
+
+    /// Entity event 19: the server rolled the tentacle clock over.
+    pub fn squid_tentacle_reset(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && matches!(
+                entity.entity_type,
+                EntityKind::Squid | EntityKind::GlowSquid
+            )
+        {
+            entity.tentacle_movement = 0.0;
+        }
+    }
+
+    /// `Armadillo.handleEntityEvent` 64: restart the peek animation. Returns
+    /// where to play the peek sound.
+    pub fn armadillo_peek(&mut self, id: i32) -> Option<Position> {
+        let entity = self.living.get_mut(&id)?;
+        if entity.entity_type != EntityKind::Armadillo {
+            return None;
+        }
+        entity.armadillo.peek_received = true;
+        Some(entity.position)
+    }
+
+    /// Goat entity events 58 / 59: start / stop lowering the head to ram.
+    pub fn set_goat_lowering_head(&mut self, id: i32, lowering: bool) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::Goat
+        {
+            entity.goat.lowering_head = lowering;
+        }
+    }
+
+    /// Iron golem punch (entity event 4): vanilla runs a 10-tick swing.
+    pub fn golem_punch(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::IronGolem
+        {
+            entity.golem_attack_ticks = 10;
+        }
+    }
+
+    /// Iron golem flower offer start / stop (entity events 11 / 34): a
+    /// 400-tick hold.
+    pub fn set_golem_offering_flower(&mut self, id: i32, offering: bool) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.entity_type == EntityKind::IronGolem
+        {
+            entity.golem_offer_flower_ticks = if offering { 400 } else { 0 };
+        }
+    }
+
+    /// Begins an arm swing (server `Animate` packet). Restarts when idle or
+    /// past the halfway point (vanilla `LivingEntity.swing`); `swing_time`
+    /// counts down, so that is `swing_time <= SWING_DURATION / 2`.
+    pub fn start_swing(&mut self, id: i32) {
+        if let Some(entity) = self.living.get_mut(&id)
+            && entity.swing_time <= SWING_DURATION / 2
+        {
+            entity.swing_time = SWING_DURATION;
+        }
+    }
+
+    /// Rotation half of any movement packet: rotation plus onGround. Extends
+    /// any in-flight position lerp instead of re-targeting it (vanilla
+    /// `moveOrInterpolateTo` rotation overloads).
+    pub fn rotate_living(&mut self, id: i32, y_rot_deg: f32, x_rot_deg: f32, on_ground: bool) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.interp_look_dir = LookDirection::new(y_rot_deg, x_rot_deg);
+            entity.interp_steps = entity.interp_steps.max(INTERPOLATION_STEPS);
+            entity.on_ground = on_ground;
+        }
+    }
+
+    pub fn update_head_rotation(&mut self, id: i32, head_y_rot_deg: f32) {
+        if let Some(entity) = self.living.get_mut(&id) {
+            entity.interp_head_y_rot_deg = head_y_rot_deg;
+            entity.interp_head_y_rot_steps = INTERPOLATION_STEPS;
+        }
+    }
+
+    pub fn remove_living(&mut self, id: i32) -> Option<LivingEntity> {
+        self.living.remove(&id)
+    }
+
+    pub fn has_player_uuid(&self, uuid: &uuid::Uuid) -> bool {
+        self.player_by_uuid(uuid).is_some()
+    }
+
+    pub fn player_by_uuid(&self, uuid: &uuid::Uuid) -> Option<&LivingEntity> {
+        self.living
+            .values()
+            .find(|entity| entity.player_uuid == Some(*uuid))
+    }
+
+    pub fn tick_living(
+        &mut self,
+        chunks: &ChunkStore,
+        block_state_table: BlockStateTable,
+        player_position: Position,
+        local_push_box: Option<Aabb>,
+        pusher_allowed: impl Fn(i32, &LivingEntity) -> bool,
+        simulation_distance: u32,
+    ) -> DVec3 {
+        let mut local_push = DVec3::ZERO;
+        let thundering = self.thundering;
+        for (&id, entity) in &mut self.living {
+            entity.tick_interpolation();
+            // A scared armadillo's body control skips its client tick.
+            if !(entity.entity_type == EntityKind::Armadillo && entity.armadillo.is_scared()) {
+                entity.tick_body_rotation();
+            }
+            let dx = entity.position.x - entity.prev_position.x;
+            let dz = entity.position.z - entity.prev_position.z;
+            let dy = if omnidirectional_air_mover(entity.entity_type) {
+                entity.position.y - entity.prev_position.y
+            } else {
+                0.0
+            };
+            if entity.health <= 0.0 {
+                stop_walk_animation(
+                    &mut entity.walk_anim_pos,
+                    &mut entity.walk_anim_speed,
+                    &mut entity.prev_walk_anim_speed,
+                );
+            } else {
+                update_walk_animation(
+                    dx,
+                    dy,
+                    dz,
+                    &mut entity.walk_anim_pos,
+                    &mut entity.walk_anim_speed,
+                    &mut entity.prev_walk_anim_speed,
+                );
+            }
+            // TODO: vanilla's `baseTick` reads the water state before the
+            // interpolation step; this probes after it, so in-water mobs
+            // (axolotl, fish) can lag a tick at a water edge.
+            if probes_water(&entity.entity_type) {
+                entity.is_in_water = entity.probe_water(chunks, block_state_table);
+            }
+            if entity.entity_type == EntityKind::Parrot {
+                entity.tick_party(chunks, block_state_table);
+            }
+            entity.tick_kind_anims();
+            if entity.entity_type == EntityKind::Panda {
+                let holding = entity.equipment(EquipmentSlot::Mainhand).is_some();
+                if entity.panda.tick(thundering, entity.is_in_water, holding) {
+                    entity.look_dir = LookDirection::new(entity.look_dir.y_rot_deg(), 0.0);
+                }
+            }
+            entity.tick_tamable_anims();
+            entity.prev_eat_anim_tick = entity.eat_anim_tick;
+            if entity.eat_anim_tick > 0 {
+                entity.eat_anim_tick -= 1;
+            }
+            if entity.hurt_time > 0 {
+                entity.hurt_time -= 1;
+            }
+            tick_death_time(
+                entity.health,
+                within_simulation_distance(entity.position, player_position, simulation_distance),
+                &mut entity.death_time,
+            );
+            if entity.swing_time > 0 {
+                entity.swing_time -= 1;
+            }
+            // `Villager.tick` and `Panda.tick` count it down, not the
+            // wandering trader.
+            if matches!(entity.entity_type, EntityKind::Villager | EntityKind::Panda)
+                && entity.unhappy_counter > 0
+            {
+                entity.unhappy_counter -= 1;
+            }
+            entity.age_in_ticks = entity.age_in_ticks.wrapping_add(1);
+
+            if let Some(local_box) = local_push_box
+                && pushes_local_player(entity)
+                && pusher_allowed(id, entity)
+                && living_entity_aabb(entity).intersects(&local_box)
+                && let Some((local_impulse, remote_impulse)) =
+                    living_push_impulses(player_position, entity.position)
+            {
+                local_push += local_impulse;
+                if accepts_reciprocal_push(entity) {
+                    entity.velocity += remote_impulse;
+                }
+            }
+        }
+        local_push
+    }
+}
+
+pub fn stop_walk_animation(walk_pos: &mut f32, walk_speed: &mut f32, prev_walk_speed: &mut f32) {
+    *prev_walk_speed = 0.0;
+    *walk_speed = 0.0;
+    *walk_pos = 0.0;
+}
+
+/// Vanilla `calculateEntityAnimation`: `dy` counts only for an
+/// `omnidirectionalAirMover`.
+pub fn update_walk_animation(
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    walk_pos: &mut f32,
+    walk_speed: &mut f32,
+    prev_walk_speed: &mut f32,
+) {
+    let distance = ((dx * dx + dy * dy + dz * dz) as f32).sqrt();
+    let target_speed = (distance * 4.0).min(1.0);
+    *prev_walk_speed = *walk_speed;
+    *walk_speed += (target_speed - *walk_speed) * 0.4;
+    *walk_pos += *walk_speed;
+}
+
+pub fn wrap_degrees(deg: f32) -> f32 {
+    let mut d = deg % 360.0;
+    if d >= 180.0 {
+        d -= 360.0;
+    }
+    if d < -180.0 {
+        d += 360.0;
+    }
+    d
+}
+
+pub fn lerp_angle(from: f32, to: f32, alpha: f32) -> f32 {
+    from + wrap_degrees(to - from) * alpha
+}
+
+/// The horse family (vanilla `AbstractHorse` subclasses rustcraft renders).
+pub fn is_equine(kind: &EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Horse
+            | EntityKind::Donkey
+            | EntityKind::Mule
+            | EntityKind::SkeletonHorse
+            | EntityKind::ZombieHorse
+    )
+}
+
+/// Vanilla `Llama` and its `TraderLlama` subclass: `AbstractHorse`s that
+/// rustcraft renders apart from the horse family.
+pub fn is_llama(kind: EntityKind) -> bool {
+    matches!(kind, EntityKind::Llama | EntityKind::TraderLlama)
+}
+
+pub fn is_living_mob(kind: &EntityKind) -> bool {
+    is_equine(kind)
+        || is_llama(*kind)
+        || matches!(
+            kind,
+            EntityKind::Player
+                | EntityKind::Bee
+                | EntityKind::Parrot
+                | EntityKind::Pig
+                | EntityKind::Cow
+                | EntityKind::Sheep
+                | EntityKind::Chicken
+                | EntityKind::Zombie
+                | EntityKind::Skeleton
+                | EntityKind::Creeper
+                | EntityKind::Spider
+                | EntityKind::Villager
+                | EntityKind::Enderman
+                | EntityKind::Slime
+                | EntityKind::Witch
+                | EntityKind::Husk
+                | EntityKind::Drowned
+                | EntityKind::ZombieVillager
+                | EntityKind::Stray
+                | EntityKind::Bogged
+                | EntityKind::Wolf
+                | EntityKind::Cat
+                | EntityKind::Ocelot
+                | EntityKind::Rabbit
+                | EntityKind::Squid
+                | EntityKind::GlowSquid
+                | EntityKind::Bat
+                | EntityKind::Cod
+                | EntityKind::Salmon
+                | EntityKind::TropicalFish
+                | EntityKind::Pufferfish
+                | EntityKind::IronGolem
+                | EntityKind::Sniffer
+                | EntityKind::Allay
+                | EntityKind::SnowGolem
+                | EntityKind::CopperGolem
+                | EntityKind::WanderingTrader
+                | EntityKind::SulfurCube
+                | EntityKind::Fox
+                | EntityKind::Panda
+                | EntityKind::Mooshroom
+                | EntityKind::Armadillo
+                | EntityKind::Goat
+                | EntityKind::Dolphin
+                | EntityKind::Turtle
+                | EntityKind::Axolotl
+                | EntityKind::PolarBear
+        )
+}
+
+/// Vanilla `omnidirectionalAirMover`: flyers whose walk animation counts
+/// vertical movement too.
+fn omnidirectional_air_mover(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Bee | EntityKind::Parrot | EntityKind::SulfurCube
+    )
+}
+
+/// Kinds whose `wasTouchingWater` matters for rendering (fish flop pose,
+/// squid body rotation).
+fn probes_water(kind: &EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Squid
+            | EntityKind::GlowSquid
+            | EntityKind::Cod
+            | EntityKind::Salmon
+            | EntityKind::TropicalFish
+            | EntityKind::Pufferfish
+            | EntityKind::Panda
+            | EntityKind::Turtle
+            | EntityKind::Axolotl
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use azalea_registry::builtin::ItemKind;
+
+    use super::*;
+
+    #[test]
+    fn copper_golem_spins_its_head_once_per_idle_cycle() {
+        let mut golem = CopperGolemAnim {
+            idle_start_tick: 300,
+            ..Default::default()
+        };
+        let spun: Vec<u32> = (290..320)
+            .filter(|&tick| {
+                golem.tick(tick);
+                golem.head_spun
+            })
+            .collect();
+        assert_eq!(spun, [310]);
+    }
+
+    fn spawn(store: &mut EntityStore, id: i32, kind: EntityKind, position: Position) {
+        let uuid = uuid::Uuid::from_u128(id as u128);
+        store.spawn_living(id, kind, position, LookDirection::default(), uuid);
+    }
+
+    #[test]
+    fn unsynced_cats_are_black() {
+        let order = crate::renderer::pipelines::entity_renderer::CAT_VARIANT_ORDER;
+        assert_eq!(order[CAT_DEFAULT_VARIANT as usize], "black");
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Cat, Position::default());
+        assert_eq!(store.living[&1].variant, CAT_DEFAULT_VARIANT);
+    }
+
+    /// Fox type (19 = flags byte, 18 = variant with ZERO fallback) and the
+    /// client crouch spring capped at 5.
+    #[test]
+    fn fox_flags_and_crouch_spring() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Fox, Position::default());
+        store.apply_entity_data(1, 18, MetaValue::Int(1));
+        assert_eq!(store.living[&1].variant, 1);
+        store.apply_entity_data(1, 18, MetaValue::Int(7));
+        assert_eq!(store.living[&1].variant, 0);
+
+        store.apply_entity_data(1, 19, MetaValue::Byte(0x01 | 0x04 | 0x08 | 0x20));
+        let fox = &store.living[&1];
+        assert!(fox.is_sitting && fox.is_interested);
+        assert!(fox.fox.is_crouching() && fox.fox.is_sleeping());
+        assert!(!fox.fox.is_pouncing() && !fox.fox.is_faceplanted());
+        for _ in 0..30 {
+            tick(&mut store);
+        }
+        assert_eq!(store.living[&1].fox.crouch_amount, 5.0);
+        store.apply_entity_data(1, 19, MetaValue::Byte(0));
+        tick(&mut store);
+        assert_eq!(store.living[&1].fox.crouch_amount, 0.0);
+    }
+
+    /// Panda genes resolve like `Gene.getVariantFromGenes`, and the sneeze
+    /// counter runs client-side until the flag clears itself after 20 ticks.
+    #[test]
+    fn panda_genes_and_client_sneeze() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Panda, Position::default());
+        let variant = |store: &mut EntityStore, main: u8, hidden: u8| {
+            store.apply_entity_data(1, 21, MetaValue::Byte(main));
+            store.apply_entity_data(1, 22, MetaValue::Byte(hidden));
+            store.living[&1].panda.variant()
+        };
+        assert_eq!(variant(&mut store, 1, 0), 1);
+        assert_eq!(variant(&mut store, 4, 0), 0);
+        assert_eq!(variant(&mut store, 4, 4), 4);
+        assert_eq!(variant(&mut store, 5, 5), 5);
+        assert_eq!(variant(&mut store, 0xFF, 0), 0);
+
+        store.apply_entity_data(1, 23, MetaValue::Byte(0x02));
+        store.apply_entity_data(1, 19, MetaValue::Int(0));
+        for _ in 0..20 {
+            tick(&mut store);
+        }
+        assert!(store.living[&1].panda.is_sneezing());
+        assert_eq!(store.living[&1].panda.sneeze_counter, 20);
+        tick(&mut store);
+        assert!(!store.living[&1].panda.is_sneezing());
+        assert_eq!(store.living[&1].panda.sneeze_counter, 0);
+
+        store.apply_entity_data(1, 23, MetaValue::Byte(0x08));
+        tick(&mut store);
+        assert!((store.living[&1].panda.sit_amount - 0.15).abs() < 1e-6);
+
+        // `Panda.tick` counts the unhappy counter down, like the villager's.
+        store.apply_entity_data(1, 18, MetaValue::Int(2));
+        tick(&mut store);
+        assert_eq!(store.living[&1].unhappy_counter, 1);
+    }
+
+    /// Bee flags and anger drive the render state; the roll eases in by 0.2
+    /// and out by 0.24 per tick.
+    #[test]
+    fn bee_flags_and_roll() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Bee, Position::default());
+        store.apply_entity_data(1, 18, MetaValue::Byte(0x02 | 0x08));
+        store.apply_entity_data(1, 19, MetaValue::Long(500));
+        let e = &store.living[&1];
+        assert!(e.bee.is_rolling() && e.bee.has_nectar() && !e.bee.has_stung());
+        assert_eq!(e.anger_end_time, 500);
+        let tick_kind =
+            |store: &mut EntityStore| store.living.get_mut(&1).unwrap().tick_kind_anims();
+        for _ in 0..6 {
+            tick_kind(&mut store);
+        }
+        assert_eq!(store.living[&1].bee.roll_amount, 1.0);
+        store.apply_entity_data(1, 18, MetaValue::Byte(0));
+        tick_kind(&mut store);
+        let bee = &store.living[&1].bee;
+        assert_eq!((bee.prev_roll_amount, bee.roll_amount), (1.0, 0.76));
+    }
+
+    /// Parrot variants clamp; the tamable flags byte carries the sit pose;
+    /// a jukebox event within 3 blocks starts the party.
+    #[test]
+    fn parrot_variant_sitting_and_party() {
+        let mut store = EntityStore::new();
+        spawn(
+            &mut store,
+            1,
+            EntityKind::Parrot,
+            Position::new(0.5, 64.0, 0.5),
+        );
+        store.apply_entity_data(1, 20, MetaValue::Int(9));
+        store.apply_entity_data(1, 18, MetaValue::Byte(0x01));
+        assert_eq!(store.living[&1].variant, 4);
+        assert!(store.living[&1].is_sitting);
+        store.set_record_playing_nearby(BlockPos::new(3, 64, 0), true);
+        assert!(store.living[&1].party_parrot);
+        store.set_record_playing_nearby(BlockPos::new(10, 64, 0), true);
+        assert_eq!(store.living[&1].jukebox, Some(BlockPos::new(3, 64, 0)));
+        // No jukebox block in an empty world: the next tick ends it.
+        tick(&mut store);
+        assert!(!store.living[&1].party_parrot);
+    }
+
+    /// `Turtle.HAS_EGG`/`LAYING_EGG` land at 18/19 on every wire: 26.1 added
+    /// the age-locked flag ahead of them, 1.21.5 dropped `HOME_POS`.
+    #[test]
+    fn turtle_egg_flags_normalize_across_versions() {
+        let turtle = EntityKind::Turtle;
+        for (protocol, has_egg, laying_egg) in [(776, 18, 19), (770, 17, 18), (769, 18, 19)] {
+            assert_eq!(normalize_ageable_index_at(turtle, has_egg, protocol), 18);
+            assert_eq!(normalize_ageable_index_at(turtle, laying_egg, protocol), 19);
+        }
+        // Pre-1.21.5 `HOME_POS` (17) shares 18 but is a block pos.
+        assert_eq!(normalize_ageable_index_at(turtle, 17, 769), 18);
+
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, turtle, Position::default());
+        store.apply_entity_data(1, 16, MetaValue::Bool(true));
+        store.apply_entity_data(1, 18, MetaValue::Bool(true));
+        store.apply_entity_data(1, 19, MetaValue::Bool(true));
+        let e = &store.living[&1];
+        assert!(e.is_baby && e.has_egg && e.laying_egg);
+        // `Turtle.BABY_DIMENSIONS` scales by 0.3, the dolphin's by 0.65.
+        let dims = living_entity_dimensions(e);
+        assert!((dims.width - 1.2 * 0.3).abs() < 1e-6);
+
+        spawn(&mut store, 2, EntityKind::Dolphin, Position::default());
+        store.apply_entity_data(2, 16, MetaValue::Bool(true));
+        let dims = living_entity_dimensions(&store.living[&2]);
+        assert!((dims.height - 0.6 * 0.65).abs() < 1e-6);
+    }
+
+    /// `LivingEntity.aiStep` zeroes velocity components under 0.003 (a
+    /// player's horizontal pair by its squared length) after the 0.98 decay.
+    #[test]
+    fn tiny_remote_velocities_zero_each_tick() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Pig, Position::default());
+        spawn(&mut store, 2, EntityKind::Player, Position::default());
+        store.set_living_motion(1, DVec3::new(0.003, 0.5, -0.004));
+        store.set_living_motion(2, DVec3::new(0.002, 0.002, 0.002));
+        let velocity = |store: &mut EntityStore, id| {
+            let e = store.living.get_mut(&id).unwrap();
+            e.tick_interpolation();
+            e.velocity
+        };
+        let v = velocity(&mut store, 1);
+        assert_eq!((v.x, v.z), (0.0, -0.004 * 0.98));
+        assert!((v.y - 0.49).abs() < 1e-12);
+        assert_eq!(velocity(&mut store, 2), DVec3::ZERO);
+        store.set_living_motion(2, DVec3::new(0.0035, 0.0, 0.0));
+        assert_eq!(velocity(&mut store, 2).x, 0.0035 * 0.98);
+    }
+
+    /// `Sniffer.onSyncedDataUpdated`: each state update restarts the one
+    /// animation clock; idling, searching and out-of-range ids stop it.
+    #[test]
+    fn sniffer_state_drives_one_animation_clock() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Sniffer, Position::default());
+        store.living.get_mut(&1).unwrap().age_in_ticks = 40;
+        let state = |store: &EntityStore| {
+            let e = &store.living[&1];
+            (e.sniffer_state, e.sniffer_anim_start)
+        };
+
+        store.apply_entity_data(1, 18, MetaValue::Int(5));
+        assert_eq!(state(&store), (SnifferState::Digging, Some(40)));
+        assert_eq!(
+            living_entity_dimensions(&store.living[&1]).height,
+            1.75 - 0.4
+        );
+
+        store.living.get_mut(&1).unwrap().age_in_ticks = 100;
+        store.apply_entity_data(1, 18, MetaValue::Int(6));
+        assert_eq!(state(&store), (SnifferState::Rising, Some(100)));
+        assert_eq!(living_entity_dimensions(&store.living[&1]).height, 1.75);
+
+        store.apply_entity_data(1, 18, MetaValue::Int(4));
+        assert_eq!(state(&store), (SnifferState::Searching, None));
+        store.apply_entity_data(1, 18, MetaValue::Int(9));
+        assert_eq!(state(&store), (SnifferState::Idling, None));
+    }
+
+    /// `AbstractChestedHorse.DATA_ID_CHEST` (19), `Llama.DATA_VARIANT_ID`
+    /// (21) and `MushroomCow.DATA_TYPE` (18); out-of-range variant ids clamp.
+    #[test]
+    fn llama_and_mooshroom_synced_data() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::TraderLlama, Position::default());
+        spawn(&mut store, 2, EntityKind::Mooshroom, Position::default());
+
+        store.apply_entity_data(1, 19, MetaValue::Bool(true));
+        store.apply_entity_data(1, 21, MetaValue::Int(2));
+        assert!(store.living[&1].has_chest);
+        assert_eq!(store.living[&1].variant, 2);
+        store.apply_entity_data(1, 21, MetaValue::Int(7));
+        assert_eq!(store.living[&1].variant, 3);
+        store.apply_entity_data(1, 21, MetaValue::Int(-1));
+        assert_eq!(store.living[&1].variant, 0);
+        store.apply_entity_data(1, 16, MetaValue::Bool(true));
+        assert!(store.living[&1].is_baby);
+
+        store.apply_entity_data(2, 18, MetaValue::Int(1));
+        assert_eq!(store.living[&2].variant, 1);
+        store.apply_entity_data(2, 18, MetaValue::Int(5));
+        assert_eq!(store.living[&2].variant, 1);
+        store.apply_entity_data(2, 16, MetaValue::Bool(true));
+        assert!(store.living[&2].is_baby);
+    }
+
+    /// `Armadillo.setupAnimationStates`: each state runs its one clock;
+    /// entering SCARED fast-forwards the peek to its end, and a peek event
+    /// restarts it on the next tick.
+    #[test]
+    fn armadillo_state_drives_shell_and_clocks() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Armadillo, Position::default());
+        store.living.get_mut(&1).unwrap().age_in_ticks = 100;
+        let sim = |store: &EntityStore| store.living[&1].armadillo.clone();
+
+        store.apply_entity_data(1, 18, MetaValue::Int(2));
+        assert!(sim(&store).hiding_in_shell());
+        tick(&mut store);
+        assert_eq!(sim(&store).peek_start, Some(101 - 50));
+        assert!(store.armadillo_peek(1).is_some());
+        tick(&mut store);
+        assert_eq!(sim(&store).peek_start, Some(102));
+
+        store.apply_entity_data(1, 18, MetaValue::Int(3));
+        tick(&mut store);
+        let s = sim(&store);
+        assert_eq!(
+            (s.roll_out_start, s.roll_up_start, s.peek_start),
+            (Some(103), None, None)
+        );
+        assert!(s.hiding_in_shell());
+        for _ in 0..25 {
+            tick(&mut store);
+        }
+        assert!(!sim(&store).hiding_in_shell());
+
+        store.apply_entity_data(1, 18, MetaValue::Int(1));
+        for _ in 0..5 {
+            tick(&mut store);
+        }
+        let s = sim(&store);
+        assert_eq!((s.roll_out_start, s.roll_up_start), (None, Some(129)));
+        assert!(!s.hiding_in_shell());
+        tick(&mut store);
+        assert!(sim(&store).hiding_in_shell());
+
+        store.apply_entity_data(1, 18, MetaValue::Int(7));
+        tick(&mut store);
+        assert_eq!(
+            sim(&store),
+            ArmadilloSim {
+                in_state_ticks: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// `Goat.aiStep`: the ram counter climbs one a tick to 20 and falls two.
+    #[test]
+    fn goat_ram_events_lower_the_head() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Goat, Position::default());
+        store.set_goat_lowering_head(1, true);
+        for _ in 0..25 {
+            tick(&mut store);
+        }
+        let goat = &store.living[&1].goat;
+        assert_eq!(goat.lower_head_tick, 20);
+        assert_eq!(goat.ramming_x_head_rot(false), 30f32.to_radians());
+        store.set_goat_lowering_head(1, false);
+        tick(&mut store);
+        assert_eq!(store.living[&1].goat.lower_head_tick, 18);
+
+        store.apply_entity_data(1, 19, MetaValue::Bool(false));
+        assert!(!store.living[&1].goat.has_left_horn);
+        assert!(store.living[&1].goat.has_right_horn);
+    }
+
+    /// `Axolotl.DATA_VARIANT` (18) and `DATA_PLAYING_DEAD` (19): the adult
+    /// ramps its eased playing-dead animator, the baby solos one
+    /// `AnimationState` that keeps its clock while it stays selected.
+    #[test]
+    fn axolotl_synced_data_drives_its_animations() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Axolotl, Position::default());
+        store.apply_entity_data(1, 18, MetaValue::Int(4));
+        assert_eq!(store.living[&1].variant, 4);
+        store.apply_entity_data(1, 18, MetaValue::Int(5));
+        assert_eq!(store.living[&1].variant, 0);
+
+        store.apply_entity_data(1, 19, MetaValue::Bool(true));
+        for _ in 0..5 {
+            tick(&mut store);
+        }
+        let sim = store.living[&1].axolotl;
+        assert_eq!(sim.playing_dead_animator.factor(1.0), 0.5);
+        assert_eq!(sim.in_water_animator.factor(1.0), 0.0);
+        assert_eq!(sim.baby_anim, None);
+        for _ in 0..10 {
+            tick(&mut store);
+        }
+        assert_eq!(
+            store.living[&1].axolotl.playing_dead_animator.factor(0.0),
+            1.0
+        );
+
+        store.apply_entity_data(1, 16, MetaValue::Bool(true));
+        let start = store.living[&1].age_in_ticks + 1;
+        tick(&mut store);
+        tick(&mut store);
+        assert_eq!(
+            store.living[&1].axolotl.baby_anim,
+            Some((BabyAxolotlAnim::PlayDead, start))
+        );
+        store.apply_entity_data(1, 19, MetaValue::Bool(false));
+        let start = store.living[&1].age_in_ticks + 1;
+        tick(&mut store);
+        assert_eq!(
+            store.living[&1].axolotl.baby_anim,
+            Some((BabyAxolotlAnim::IdleOnGround, start))
+        );
+    }
+
+    /// `PolarBear.DATA_STANDING_ID` (18) steps the 0..6 stand counter; the
+    /// hitbox height trails it by a tick.
+    #[test]
+    fn polar_bear_standing_stretches_its_height() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::PolarBear, Position::default());
+        store.apply_entity_data(1, 18, MetaValue::Bool(true));
+        for _ in 0..3 {
+            tick(&mut store);
+        }
+        let e = &store.living[&1];
+        assert_eq!((e.prev_stand_anim, e.stand_anim), (2.0, 3.0));
+        assert_eq!(living_entity_dimensions(e).height, 1.4 * (1.0 + 2.0 / 6.0));
+        for _ in 0..10 {
+            tick(&mut store);
+        }
+        assert_eq!(store.living[&1].stand_anim, 6.0);
+        store.apply_entity_data(1, 18, MetaValue::Bool(false));
+        tick(&mut store);
+        assert_eq!(store.living[&1].stand_anim, 5.0);
+        assert_eq!(
+            living_entity_dimensions(&store.living[&1]).height,
+            1.4 * 2.0
+        );
+    }
+
+    fn tick(store: &mut EntityStore) {
+        store.tick_living(
+            &ChunkStore::new(2),
+            BlockStateTable::native(),
+            Position::default(),
+            None,
+            |_, _| true,
+            10,
+        );
+    }
+
+    #[test]
+    fn equipment_state_replaces_and_clears_slots() {
+        let mut entity = LivingEntity::new(
+            EntityKind::Player,
+            Position::default(),
+            LookDirection::default(),
+            uuid::Uuid::nil(),
+        );
+        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
+        entity.set_equipment(EquipmentSlot::Head, helmet.clone());
+        assert_eq!(entity.equipment(EquipmentSlot::Head), Some(&helmet));
+
+        let saddle = ItemStack::new(ItemKind::Saddle, 1);
+        entity.set_equipment(EquipmentSlot::Saddle, saddle.clone());
+        assert_eq!(entity.equipment(EquipmentSlot::Saddle), Some(&saddle));
+
+        entity.set_equipment(EquipmentSlot::Head, ItemStack::Empty);
+        entity.set_equipment(EquipmentSlot::Saddle, ItemStack::Empty);
+        assert_eq!(entity.equipment(EquipmentSlot::Head), None);
+        assert_eq!(entity.equipment(EquipmentSlot::Saddle), None);
+    }
+
+    #[test]
+    fn sleeping_metadata_moves_remote_living_entity_to_bed_center() {
+        let mut store = EntityStore::new();
+        spawn(
+            &mut store,
+            1,
+            EntityKind::Villager,
+            Position::new(10.0, 70.0, 10.0),
+        );
+
+        let bed = BlockPos::new(2, 64, -5);
+        store.set_sleeping_pos(1, Some(bed));
+        let entity = &store.living[&1];
+        assert_eq!(entity.sleeping_pos, Some(bed));
+        assert_eq!(entity.position, Position::new(2.5, 64.6875, -4.5));
+        // `setPos` leaves the previous position, so the sleeper lerps in.
+        assert_eq!(entity.prev_position, Position::new(10.0, 70.0, 10.0));
+
+        store.set_sleeping_pos(1, None);
+        assert_eq!(store.living[&1].sleeping_pos, None);
+        assert_eq!(
+            store.living[&1].position,
+            Position::new(2.5, 64.6875, -4.5),
+            "clearing SLEEPING_POS does not choose the collision-dependent stand-up position"
+        );
+    }
+
+    #[test]
+    fn local_player_push_matches_vanilla_pusher_rules() {
+        let mut store = EntityStore::new();
+        for (id, kind) in [
+            (1, EntityKind::Zombie),
+            (2, EntityKind::Player),
+            (3, EntityKind::Bat),
+            (4, EntityKind::Zombie),
+            (5, EntityKind::Zombie),
+            (6, EntityKind::Parrot),
+        ] {
+            spawn(&mut store, id, kind, Position::new(0.25, 64.0, 0.0));
+        }
+        store.living.get_mut(&4).unwrap().health = 0.0;
+
+        let local = Position::new(0.0, 64.0, 0.0);
+        let local_box = Aabb::from_center(local.into(), 0.3, 0.9);
+        // Id 5 stands in for a pusher the caller's pushableBy filter rejects.
+        let impulse = store.tick_living(
+            &ChunkStore::new(2),
+            BlockStateTable::native(),
+            local,
+            Some(local_box),
+            |id, _| id != 5,
+            10,
+        );
+        let expected = f64::from(0.05_f32) * 0.5;
+
+        // A normal mob, a remote player, and a dying mob all push the local
+        // player. Bat and Parrot override the vanilla push path and don't.
+        assert_eq!(impulse, DVec3::new(-expected * 3.0, 0.0, 0.0));
+        assert_eq!(store.living[&1].velocity, DVec3::new(expected, 0.0, 0.0));
+        assert_eq!(store.living[&2].velocity, DVec3::new(expected, 0.0, 0.0));
+        assert_eq!(store.living[&3].velocity, DVec3::ZERO);
+        assert_eq!(store.living[&6].velocity, DVec3::ZERO);
+        // Dead LivingEntity::isPushable is false, so it does not receive the
+        // reciprocal impulse even though its tick still pushes the local player.
+        assert_eq!(store.living[&4].velocity, DVec3::ZERO);
+        assert_eq!(store.living[&5].velocity, DVec3::ZERO);
+    }
+
+    #[test]
+    fn remote_velocity_decays_only_while_not_interpolating() {
+        let mut store = EntityStore::new();
+        spawn(
+            &mut store,
+            1,
+            EntityKind::Zombie,
+            Position::new(0.0, 64.0, 0.0),
+        );
+        store.set_living_motion(1, DVec3::new(1.0, 0.0, 0.0));
+        store.move_living_delta(1, 1.0, 0.0, 0.0, true);
+        tick(&mut store);
+        assert_eq!(store.living[&1].velocity, DVec3::new(1.0, 0.0, 0.0));
+
+        let entity = store.living.get_mut(&1).unwrap();
+        entity.interp_steps = 0;
+        tick(&mut store);
+        assert_eq!(store.living[&1].velocity, DVec3::new(0.98, 0.0, 0.0));
+    }
+
+    #[test]
+    fn living_push_impulse_matches_vanilla_entity_push_math() {
+        let local = Position::new(0.0, 64.0, 0.0);
+        let remote = Position::new(0.25, 64.0, 0.0);
+        let (local_impulse, remote_impulse) = living_push_impulses(local, remote).unwrap();
+        let expected = f64::from(0.05_f32) * 0.5;
+        assert_eq!(local_impulse, DVec3::new(-expected, 0.0, 0.0));
+        assert_eq!(remote_impulse, DVec3::new(expected, 0.0, 0.0));
+        assert!(living_push_impulses(local, Position::new(0.009, 64.0, 0.0)).is_none());
+    }
+
+    #[test]
+    fn tick_living_advances_remote_interpolation_state() {
+        let mut store = EntityStore::new();
+        spawn(
+            &mut store,
+            1,
+            EntityKind::Zombie,
+            Position::new(0.0, 64.0, 0.0),
+        );
+        store.move_living_delta(1, 3.0, 0.0, 0.0, true);
+        let before = store.living[&1].position;
+
+        tick(&mut store);
+
+        let entity = &store.living[&1];
+        assert_eq!(
+            entity.prev_position, before,
+            "each world tick must advance the remote entity interpolation endpoint"
+        );
+        assert_ne!(
+            entity.position, before,
+            "a pending remote movement interpolation must keep progressing"
+        );
+        assert_eq!(
+            entity.age_in_ticks, 1,
+            "remote living entities must keep receiving client ticks"
+        );
+    }
+
+    #[test]
+    fn stop_walk_animation_matches_vanilla_state_reset() {
+        let mut position = 12.5;
+        let mut speed = 0.7;
+        let mut speed_old = 0.4;
+
+        stop_walk_animation(&mut position, &mut speed, &mut speed_old);
+
+        assert_eq!(
+            position, 0.0,
+            "vanilla stop() clears walk animation position"
+        );
+        assert_eq!(speed, 0.0, "vanilla stop() clears current walk speed");
+        assert_eq!(speed_old, 0.0, "vanilla stop() clears previous walk speed");
+    }
+
+    #[test]
+    fn death_clock_matches_health_and_simulation_distance_boundaries() {
+        let mut death_time = 7;
+        tick_death_time(0.01, true, &mut death_time);
+        assert_eq!(
+            death_time, 7,
+            "vanilla does not rewind deathTime merely because health is positive"
+        );
+
+        tick_death_time(0.0, false, &mut death_time);
+        assert_eq!(
+            death_time, 7,
+            "dead entities outside simulation distance must not advance deathTime"
+        );
+        tick_death_time(0.0, true, &mut death_time);
+        assert_eq!(
+            death_time, 8,
+            "zero health in simulation range advances deathTime"
+        );
+        tick_death_time(-1.0, true, &mut death_time);
+        assert_eq!(
+            death_time, 9,
+            "non-positive health in simulation range keeps advancing deathTime"
+        );
+    }
+
+    #[test]
+    fn death_simulation_distance_uses_chunk_chessboard_distance() {
+        let player = Position::new(15.9, 64.0, -0.1);
+        assert!(within_simulation_distance(
+            Position::new(16.0 * 10.0, 64.0, -16.0 * 10.0),
+            player,
+            10,
+        ));
+        assert!(
+            !within_simulation_distance(Position::new(16.0 * 11.0, 64.0, 0.0), player, 10,),
+            "chunk 11 must be outside a simulation distance of 10"
+        );
+    }
+
+    #[test]
+    fn shared_flags_carry_glowing_for_mobs_and_items() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Pig, Position::default());
+        store.apply_entity_data(1, 0, MetaValue::Byte(SHARED_FLAG_GLOWING | 0x20));
+        assert!(store.living[&1].is_glowing);
+        assert!(store.living[&1].is_invisible);
+        store.apply_entity_data(1, 0, MetaValue::Byte(0));
+        assert!(!store.living[&1].is_glowing);
+
+        let mut items = ItemEntityStore::new();
+        items.spawn_item(2, uuid::Uuid::nil(), Position::default(), DVec3::ZERO);
+        items.set_shared_flags(2, SHARED_FLAG_GLOWING);
+        assert!(items.items[&2].is_glowing);
+    }
+
+    #[test]
+    fn death_event_forces_mobs_but_not_players_to_zero_health() {
+        let mut store = EntityStore::new();
+        spawn(&mut store, 1, EntityKind::Zombie, Position::default());
+        spawn(&mut store, 2, EntityKind::Player, Position::default());
+
+        store.living.get_mut(&1).unwrap().death_time = 6;
+        store.living.get_mut(&1).unwrap().is_crouching = true;
+        store.mark_dead(1);
+        store.mark_dead(2);
+
+        assert_eq!(
+            store.living[&1].health, 0.0,
+            "vanilla event 3 kills non-player living entities client-side"
+        );
+        assert_eq!(
+            store.living[&1].death_time, 6,
+            "event 3 must not restart an already-running vanilla death clock"
+        );
+        assert!(
+            !store.living[&1].is_crouching,
+            "non-player event 3 transitions the entity to the DYING pose"
+        );
+        assert_eq!(
+            store.living[&2].health, 20.0,
+            "vanilla event 3 does not set player health client-side"
+        );
+    }
+
+    #[test]
+    fn player_index_normalization() {
+        let at = |index, protocol| normalize_player_index_at(EntityKind::Player, index, protocol);
+        // <= 772 permutes the four Avatar/Player fields into 26.x order.
+        assert_eq!(at(15, 772), 17); // absorption
+        assert_eq!(at(16, 772), 18); // score
+        assert_eq!(at(17, 772), 16); // mode customisation
+        assert_eq!(at(18, 772), 15); // main hand
+        let mut mapped: Vec<u8> = (15..=18).map(|i| at(i, 764)).collect();
+        mapped.sort_unstable();
+        assert_eq!(mapped, [15, 16, 17, 18]);
+        // 1.21.10 and newer already use the 26.x order; other kinds keep
+        // their own subclass indices.
+        assert_eq!(at(15, 773), 15);
+        assert_eq!(at(17, 776), 17);
+        assert_eq!(normalize_player_index_at(EntityKind::Zombie, 15, 772), 15);
+    }
+}

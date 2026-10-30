@@ -1,0 +1,179 @@
+use std::collections::HashMap;
+
+use rustcraft_protocol::player_info::Actions;
+use uuid::Uuid;
+
+use crate::net::chat_security::{SignedChatBody, ValidatedChatSession, verify_player_message};
+use crate::ui::hud::Scoreboard;
+use crate::ui::text::TextSpan;
+
+#[derive(Clone, Debug)]
+pub struct PlayerInfoEntry {
+    pub uuid: Uuid,
+    pub name: String,
+    pub textures: Option<String>,
+    /// 0 survival, 1 creative, 2 adventure, 3 spectator.
+    pub game_mode: u8,
+    pub listed: bool,
+    pub latency: i32,
+    pub display_name: Option<Vec<TextSpan>>,
+    pub list_order: i32,
+    pub chat_session: Option<ValidatedChatSession>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TabListPlayer {
+    pub uuid: Uuid,
+    pub name: String,
+    pub textures: Option<String>,
+    pub display_name: Option<Vec<TextSpan>>,
+    pub game_mode: u8,
+    pub latency: i32,
+    pub listed: bool,
+    pub list_order: i32,
+    pub chat_session: Option<ValidatedChatSession>,
+    chat_chain_valid: bool,
+    /// The last accepted message's index and signature.
+    last_chat: Option<(i32, [u8; 256])>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerChatValidation {
+    Signed,
+    Unsigned,
+    Invalid,
+}
+
+impl TabListPlayer {
+    pub fn validate_chat_message(
+        &mut self,
+        body: &SignedChatBody,
+        signature: Option<&[u8; 256]>,
+        enforces_secure_chat: bool,
+        now_ms: u64,
+    ) -> PlayerChatValidation {
+        let Some(session) = self.chat_session.as_ref() else {
+            return if enforces_secure_chat {
+                PlayerChatValidation::Invalid
+            } else {
+                PlayerChatValidation::Unsigned
+            };
+        };
+        // Vanilla `SignedMessageValidator.KeyBased`: expiry, then the
+        // signature, then the chain, which accepts a repeat of the last
+        // message (a signature covers the index and body).
+        let valid = self.chat_chain_valid
+            && !session.expired_with_grace(now_ms)
+            && signature.is_some_and(|signature| {
+                verify_player_message(session, self.uuid, body, signature)
+                    && self.last_chat.is_none_or(|(index, last)| {
+                        (index, last) == (body.message_index, *signature)
+                            || body.message_index > index
+                    })
+            });
+        self.chat_chain_valid = valid;
+        match signature.filter(|_| valid) {
+            Some(signature) => {
+                self.last_chat = Some((body.message_index, *signature));
+                PlayerChatValidation::Signed
+            }
+            None => PlayerChatValidation::Invalid,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct TabList {
+    pub players: HashMap<Uuid, TabListPlayer>,
+    pub header: Option<Vec<TextSpan>>,
+    pub footer: Option<Vec<TextSpan>>,
+}
+
+impl TabList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.players.clear();
+        self.header = None;
+        self.footer = None;
+    }
+
+    pub fn apply_update(&mut self, actions: &Actions, entries: &[PlayerInfoEntry]) {
+        for e in entries {
+            if actions.add_player {
+                self.players.insert(
+                    e.uuid,
+                    TabListPlayer {
+                        uuid: e.uuid,
+                        name: e.name.clone(),
+                        textures: e.textures.clone(),
+                        display_name: e.display_name.clone(),
+                        game_mode: e.game_mode,
+                        latency: e.latency,
+                        listed: e.listed,
+                        list_order: e.list_order,
+                        chat_session: e.chat_session.clone(),
+                        chat_chain_valid: true,
+                        last_chat: None,
+                    },
+                );
+            } else if let Some(p) = self.players.get_mut(&e.uuid) {
+                if let Some(textures) = &e.textures {
+                    p.textures = Some(textures.clone());
+                }
+                if actions.initialize_chat {
+                    p.chat_session = e.chat_session.clone();
+                    p.chat_chain_valid = true;
+                    p.last_chat = None;
+                }
+                if actions.update_game_mode {
+                    p.game_mode = e.game_mode;
+                }
+                if actions.update_listed {
+                    p.listed = e.listed;
+                }
+                if actions.update_latency {
+                    p.latency = e.latency;
+                }
+                if actions.update_display_name {
+                    p.display_name = e.display_name.clone();
+                }
+                if actions.update_list_order {
+                    p.list_order = e.list_order;
+                }
+            }
+        }
+    }
+
+    pub fn remove(&mut self, uuids: &[Uuid]) {
+        for id in uuids {
+            self.players.remove(id);
+        }
+    }
+
+    pub fn set_header_footer(&mut self, header: Vec<TextSpan>, footer: Vec<TextSpan>) {
+        self.header = (!header.is_empty()).then_some(header);
+        self.footer = (!footer.is_empty()).then_some(footer);
+    }
+
+    /// Vanilla PlayerTabOverlay PLAYER_COMPARATOR (PlayerTabOverlay.java:63).
+    pub fn sorted_listed(&self, scoreboard: &Scoreboard) -> Vec<&TabListPlayer> {
+        let mut out: Vec<&TabListPlayer> = self.players.values().filter(|p| p.listed).collect();
+        out.sort_by(|a, b| {
+            // `comparingInt(p -> -p.getTabListOrder())`: higher order first.
+            b.list_order
+                .cmp(&a.list_order)
+                .then_with(|| (a.game_mode == 3).cmp(&(b.game_mode == 3)))
+                .then_with(|| {
+                    scoreboard
+                        .team_name(&a.name)
+                        .cmp(scoreboard.team_name(&b.name))
+                })
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        out.truncate(80);
+        out
+    }
+}

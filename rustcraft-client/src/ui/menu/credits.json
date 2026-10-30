@@ -1,0 +1,62 @@
+[
+  {
+    "section": "",
+    "disciplines": [
+      {
+        "discipline": "",
+        "titles": [
+          {
+            "title": "Created By",
+            "names": ["WeakzzyTech"]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "section": "Built With",
+    "disciplines": [
+      {
+        "discipline": "",
+        "titles": [
+          {
+            "title": "Networking",
+            "names": ["azalea", "simdnbt"]
+          },
+          {
+            "title": "Rendering",
+            "names": [
+              "ash",
+              "gpu-allocator",
+              "binary-greedy-meshing",
+              "glam",
+              "fontdue"
+            ]
+          },
+          {
+            "title": "Platform",
+            "names": ["winit", "OpenAL Soft", "libloading", "symphonia", "tokio"]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "section": "Minecraft",
+    "disciplines": [
+      {
+        "discipline": "",
+        "titles": [
+          {
+            "title": "Original Game By",
+            "names": ["Mojang Studios"]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "section": "Thank You For Playing",
+    "disciplines": []
+  }
+]

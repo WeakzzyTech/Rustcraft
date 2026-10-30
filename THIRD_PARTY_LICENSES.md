@@ -1,0 +1,162 @@
+# Third-Party Licenses
+
+## Inspirateur/binary-greedy-meshing
+
+This project includes portions of code taken and modified from binary-greedy-meshing.
+
+Source: <https://github.com/Inspirateur/binary-greedy-meshing>
+
+License: MIT
+
+Copyright (c) 2024 Teo Orthlieb
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## ash-rs/ash
+
+This project includes portions of code taken from the Ash project.
+
+Source: <https://github.com/ash-rs/ash>
+
+License: MIT 
+
+Copyright (c) 2016 ASH
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+## Traverse-Research/gpu-allocator
+
+This project includes `rustcraft-gpu-allocator`, a modified port of gpu-allocator
+adapted for use with the pyronyx Vulkan bindings.
+
+Source: <https://github.com/Traverse-Research/gpu-allocator>
+
+License: MIT 
+
+Copyright (c) 2021 Traverse Research B.V.
+Copyright (c) 2026 Arsenii Nepeyvoda (arse09)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Steel-Foundation/SteelMC
+
+`rustcraft-singleplayer` links SteelMC, vendored as the `third_party/SteelMC`
+submodule, to run singleplayer worlds inside the client. Because SteelMC is
+AGPL-3.0-or-later, `rustcraft-singleplayer` is too; GPLv3 section 13 permits the
+combination with the GPL-3.0-or-later client. Builds with
+`--no-default-features` do not include it.
+
+Source: <https://github.com/Steel-Foundation/SteelMC>
+
+License: AGPL-3.0-or-later. Full text at
+[SteelMC/LICENSE](https://github.com/Steel-Foundation/SteelMC/blob/88e6e2599f939060577eea248aece80ae82b10d4/LICENSE)
+(the submodule's pinned commit).
+
+## kcat/openal-soft
+
+Release archives bundle, and the `just client-dev` / `client-build` /
+`client-release` recipes stage next to dev binaries, the unmodified OpenAL Soft
+native library shipped with Minecraft 26.2's LWJGL natives. The LWJGL release,
+jar member and checksum are recorded in
+`rustcraft-client/third-party/openal-natives.txt`.
+
+Source: <https://github.com/kcat/openal-soft>
+
+License: GNU Library General Public License version 2. Full text at
+[rustcraft-client/third-party/OpenAL-Soft-LICENSE.txt](./rustcraft-client/third-party/OpenAL-Soft-LICENSE.txt),
+with the bundling notice in
+[rustcraft-client/third-party/OpenAL-Soft-NOTICE.txt](./rustcraft-client/third-party/OpenAL-Soft-NOTICE.txt).
+
+## KhronosGroup/MoltenVK and KhronosGroup/Vulkan-Loader
+
+macOS releases bundle the unmodified MoltenVK library (`libMoltenVK.dylib`, its
+`MoltenVK_icd.json`) and Vulkan loader (`libvulkan.1.dylib`) from the Vulkan
+SDK, since macOS has no system Vulkan.
+
+Source: <https://github.com/KhronosGroup/MoltenVK>,
+<https://github.com/KhronosGroup/Vulkan-Loader>
+
+License: Apache-2.0 (the loader's few other files are under more permissive
+licenses, as its `LICENSE.txt` notes).
+
+## AppImage/type2-runtime
+
+Linux AppImages start through the unmodified AppImage type 2 runtime, which
+statically links its FUSE and SquashFS dependencies under their own licenses.
+
+Source: <https://github.com/AppImage/type2-runtime>
+
+License: MIT.
+
+## azalea-rs/azalea
+
+`rustcraft-block` is a data-free shim patched in place of azalea-block, keeping its
+public types so the rest of azalea compiles while block semantics come from
+Rustcraft's own per-version tables. Azalea itself remains a dependency for the
+typed protocol layer.
+
+Source: <https://github.com/azalea-rs/azalea>
+
+License: MIT
+
+Copyright (c) 2022 mat
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

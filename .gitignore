@@ -1,0 +1,6 @@
+/target
+/node_modules
+/reference
+/test-server
+/logs
+/tools/stategen/out

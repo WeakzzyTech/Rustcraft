@@ -1,0 +1,338 @@
+//! Rustcraft-owned outbound packet encoding, sent through the connection's raw
+//! write path (which still handles framing/compression/encryption). Grows as
+//! packets migrate off azalea's serializers.
+
+use glam::DVec3;
+
+use crate::packets::{Direction, PacketTable, Phase};
+
+pub fn game_serverbound_id(name: &str) -> u32 {
+    PacketTable::native()
+        .id(Phase::Game, Direction::Serverbound, name)
+        .unwrap_or_else(|| panic!("{name} missing from packet table"))
+}
+
+/// Vanilla `ServerboundInteractPacket`: right-click on an entity with `hand`
+/// (0 main, 1 off). `location` is the hit point relative to the entity origin.
+pub fn encode_interact(entity_id: i32, hand: u32, location: DVec3, sneaking: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("interact"));
+    write_varint(&mut buf, entity_id as u32);
+    write_varint(&mut buf, hand);
+    write_lp_vec3(&mut buf, location);
+    buf.push(sneaking as u8);
+    buf
+}
+
+/// Vanilla `ServerboundAttackPacket`: left-click on an entity. Encoded here
+/// because azalea serializes the entity id as a fixed i32 instead of a
+/// varint.
+pub fn encode_attack(entity_id: i32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("attack"));
+    write_varint(&mut buf, entity_id as u32);
+    buf
+}
+
+/// Vanilla 26.2 `ServerboundPickItemFromBlockPacket`: packed BlockPos then
+/// whether Ctrl requested block-entity/component data.
+pub fn encode_pick_item_from_block(x: i32, y: i32, z: i32, include_data: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("pick_item_from_block"));
+    let packed = ((i64::from(x) & 0x3ff_ffff) << 38)
+        | ((i64::from(z) & 0x3ff_ffff) << 12)
+        | (i64::from(y) & 0xfff);
+    buf.extend_from_slice(&packed.to_be_bytes());
+    buf.push(include_data as u8);
+    buf
+}
+
+/// Vanilla 26.2 `ServerboundPickItemFromEntityPacket`: entity VarInt then
+/// the Ctrl/include-data flag.
+pub fn encode_pick_item_from_entity(entity_id: i32, include_data: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("pick_item_from_entity"));
+    write_varint(&mut buf, entity_id as u32);
+    buf.push(include_data as u8);
+    buf
+}
+
+/// Vanilla 26.2 `ServerboundPlaceRecipePacket`: container id, recipe display
+/// id, then whether Shift requested the maximum craftable amount.
+pub fn encode_place_recipe(
+    container_id: i32,
+    recipe_display_id: u32,
+    use_max_items: bool,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("place_recipe"));
+    write_varint(&mut buf, container_id as u32);
+    write_varint(&mut buf, recipe_display_id);
+    buf.push(use_max_items as u8);
+    buf
+}
+
+/// Vanilla `RecipeBookType` enum order used by the settings packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RecipeBookType {
+    Crafting = 0,
+    Furnace = 1,
+    BlastFurnace = 2,
+    Smoker = 3,
+}
+
+/// Vanilla 26.2 `ServerboundRecipeBookChangeSettingsPacket`.
+pub fn encode_recipe_book_change_settings(
+    kind: RecipeBookType,
+    open: bool,
+    filtering: bool,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("recipe_book_change_settings"));
+    write_varint(&mut buf, kind as u32);
+    buf.push(open as u8);
+    buf.push(filtering as u8);
+    buf
+}
+
+/// Vanilla 26.2 `ServerboundRecipeBookSeenRecipePacket`.
+pub fn encode_recipe_book_seen_recipe(recipe_display_id: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("recipe_book_seen_recipe"));
+    write_varint(&mut buf, recipe_display_id);
+    buf
+}
+
+/// Vanilla 26.2 `ServerboundSetCreativeModeSlotPacket`: the slot, then
+/// `ItemStack.OPTIONAL_UNTRUSTED_STREAM_CODEC`, whose patch length-prefixes
+/// each component value.
+pub fn encode_set_creative_mode_slot(slot: i16, stack: Option<&crate::item::ItemStack>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varint(&mut buf, game_serverbound_id("set_creative_mode_slot"));
+    buf.extend(slot.to_be_bytes());
+    crate::item::write_stack(&mut buf, stack, true);
+    buf
+}
+
+/// Reads one varint, advancing `pos`; `None` on truncation or overlong data.
+pub fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    let mut v = 0u32;
+    for shift in 0..5 {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        v |= u32::from(byte & 0x7F) << (shift * 7);
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+pub fn write_varint(buf: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Vanilla `VarLong.write`.
+pub fn write_varlong(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Vanilla `Utf8String.write`: a varint byte length, then UTF-8.
+pub fn write_utf(buf: &mut Vec<u8>, s: &str) {
+    write_varint(buf, s.len() as u32);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// Vanilla `LpVec3.write`: a low-precision vec3. Each component is quantized
+/// to 15 bits of the fraction `component / scale`, packed with the scale's low
+/// 2 bits (plus a continuation flag and varint for larger scales) into 6
+/// bytes.
+pub fn write_lp_vec3(buf: &mut Vec<u8>, v: DVec3) {
+    const ABS_MAX_VALUE: f64 = 1.717_986_918_3e10;
+    const ABS_MIN_VALUE: f64 = 3.051_944_088_384_301e-5;
+
+    fn sanitize(value: f64) -> f64 {
+        if value.is_nan() {
+            0.0
+        } else {
+            value.clamp(-ABS_MAX_VALUE, ABS_MAX_VALUE)
+        }
+    }
+    // Java `Math.round`: round half up, not half to even.
+    fn pack(value: f64) -> u64 {
+        ((value * 0.5 + 0.5) * 32766.0 + 0.5).floor() as u64
+    }
+
+    let x = sanitize(v.x);
+    let y = sanitize(v.y);
+    let z = sanitize(v.z);
+    let chessboard_length = x.abs().max(y.abs()).max(z.abs());
+    if chessboard_length < ABS_MIN_VALUE {
+        buf.push(0);
+        return;
+    }
+    let scale = chessboard_length.ceil() as u64;
+    let is_partial = (scale & 3) != scale;
+    let markers = if is_partial { (scale & 3) | 4 } else { scale };
+    let buffer = markers
+        | pack(x / scale as f64) << 3
+        | pack(y / scale as f64) << 18
+        | pack(z / scale as f64) << 33;
+    buf.push(buffer as u8);
+    buf.push((buffer >> 8) as u8);
+    buf.extend_from_slice(&((buffer >> 16) as u32).to_be_bytes());
+    if is_partial {
+        write_varint(buf, (scale >> 2) as u32);
+    }
+}
+
+/// Vanilla `LpVec3.read`, the inverse of [`write_lp_vec3`]; advances `pos`.
+pub fn read_lp_vec3(bytes: &[u8], pos: &mut usize) -> Option<DVec3> {
+    fn unpack(value: u64) -> f64 {
+        (value & 0x7FFF).min(32766) as f64 * 2.0 / 32766.0 - 1.0
+    }
+
+    let lowest = *bytes.get(*pos)?;
+    *pos += 1;
+    if lowest == 0 {
+        return Some(DVec3::ZERO);
+    }
+    let middle = *bytes.get(*pos)?;
+    *pos += 1;
+    let highest = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?);
+    *pos += 4;
+    let buffer = (u64::from(highest) << 16) | (u64::from(middle) << 8) | u64::from(lowest);
+    let mut scale = u64::from(lowest & 3);
+    if lowest & 4 != 0 {
+        scale |= u64::from(read_varint(bytes, pos)?) << 2;
+    }
+    Some(DVec3::new(
+        unpack(buffer >> 3) * scale as f64,
+        unpack(buffer >> 18) * scale as f64,
+        unpack(buffer >> 33) * scale as f64,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The azalea LpVec3 round-trip cross-check lives in rustcraft-client's
+    // net::azalea_compat (this crate stays azalea-free).
+
+    #[test]
+    fn interact_packet_layout() {
+        // id 0x1A, entity id 42, hand, LpVec3 zero byte, sneaking.
+        assert_eq!(
+            encode_interact(42, 0, DVec3::ZERO, true),
+            [0x1A, 42, 0, 0, 1]
+        );
+        assert_eq!(
+            encode_interact(42, 1, DVec3::ZERO, false),
+            [0x1A, 42, 1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn attack_packet_layout() {
+        // id 0x01, entity id 42.
+        assert_eq!(encode_attack(42), [0x01, 42]);
+    }
+
+    #[test]
+    fn pick_item_packet_layouts() {
+        assert_eq!(
+            encode_pick_item_from_block(1, 2, 3, true),
+            [0x24, 0, 0, 0, 64, 0, 0, 48, 2, 1]
+        );
+        assert_eq!(
+            encode_pick_item_from_block(-1, -2, -3, false),
+            [0x24, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xdf, 0xfe, 0]
+        );
+        assert_eq!(encode_pick_item_from_entity(42, false), [0x25, 42, 0]);
+        assert_eq!(
+            encode_pick_item_from_entity(300, true),
+            [0x25, 0xac, 0x02, 1]
+        );
+    }
+
+    #[test]
+    fn recipe_book_packet_layouts() {
+        // Packet ids come from the native 26.2 serverbound table.
+        assert_eq!(encode_place_recipe(7, 300, true), [0x27, 7, 0xac, 0x02, 1]);
+        assert_eq!(
+            encode_recipe_book_change_settings(RecipeBookType::BlastFurnace, true, false),
+            [0x2e, 2, 1, 0]
+        );
+        assert_eq!(encode_recipe_book_seen_recipe(300), [0x2f, 0xac, 0x02]);
+    }
+
+    #[test]
+    fn lp_vec3_round_trip() {
+        for v in [
+            DVec3::ZERO,
+            DVec3::new(0.25, -0.5, 0.75),
+            DVec3::new(1.5, -2.0, 3.25),
+            DVec3::new(100.0, -250.5, 0.125),
+        ] {
+            let mut buf = Vec::new();
+            write_lp_vec3(&mut buf, v);
+            let mut pos = 0;
+            let read = read_lp_vec3(&buf, &mut pos).unwrap();
+            assert_eq!(pos, buf.len());
+            // 15-bit quantization per axis, scaled by the chessboard length.
+            let tolerance = v.abs().max_element().ceil().max(1.0) / 16383.0;
+            assert!((read - v).abs().max_element() <= tolerance, "{v} -> {read}");
+        }
+    }
+
+    #[test]
+    fn varint_round_trip() {
+        for v in [0u32, 1, 127, 128, 300, 25565, u32::MAX] {
+            let mut buf = Vec::new();
+            write_varint(&mut buf, v);
+            let mut pos = 0;
+            assert_eq!(read_varint(&buf, &mut pos), Some(v));
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn varlong_layout() {
+        let encode = |v| {
+            let mut buf = Vec::new();
+            write_varlong(&mut buf, v);
+            buf
+        };
+        assert_eq!(encode(0), [0x00]);
+        assert_eq!(encode(300), [0xAC, 0x02]);
+        assert_eq!(encode(24_000), [0xC0, 0xBB, 0x01]);
+        assert_eq!(
+            encode(u64::MAX),
+            [0xFF; 9].into_iter().chain([0x01]).collect::<Vec<_>>()
+        );
+        for v in [0, 300, 24_000, u64::MAX] {
+            let bytes = encode(v);
+            let mut r = crate::codec::Reader::new(&bytes);
+            assert_eq!(r.varlong().unwrap(), v);
+            assert_eq!(r.remaining(), 0);
+        }
+    }
+}

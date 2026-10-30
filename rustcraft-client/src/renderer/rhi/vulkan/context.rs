@@ -1,0 +1,541 @@
+use std::ffi::{CStr, c_char};
+
+use rustcraft_gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+#[cfg(debug_assertions)]
+use pyronyx::ext::debug_utils::DebugUtilsInstance;
+use pyronyx::khr::surface::{SurfaceInstance, SurfacePhysicalDevice};
+#[cfg(not(mobile))]
+use pyronyx::raw_window_handle::{create_surface, get_required_extensions};
+use pyronyx::{khr, vk};
+#[cfg(not(mobile))]
+use raw_window_handle::HasDisplayHandle;
+use raw_window_handle::HasWindowHandle;
+use thiserror::Error;
+use winit::window::Window;
+
+use crate::renderer::rhi::IndirectDrawFeatures;
+
+#[derive(Error, Debug)]
+pub enum ContextError {
+    #[error("Vulkan error: {0}")]
+    Vulkan(#[from] vk::Error),
+
+    #[error("no suitable GPU found")]
+    NoSuitableGpu,
+
+    #[error("allocator error: {0}")]
+    Allocator(#[from] rustcraft_gpu_allocator::AllocationError),
+
+    #[error("{0}")]
+    Texture(String),
+
+    #[error("surface error: {0}")]
+    HandleError(#[from] raw_window_handle::HandleError),
+}
+
+const VK_APP_NAME: &CStr = c"Rustcraft";
+const VK_APP_VERSION: u32 = vk::make_api_version(0, 0, 1, 0);
+const VK_ENGINE_NAME: &CStr = c"Rustcraft Engine";
+const VK_ENGINE_VERSION: u32 = vk::make_api_version(0, 0, 1, 0);
+// 1.2 is the highest feature set used; requesting higher makes injected layers
+// (e.g. VK_LAYER_OBS_HOOK, capped at 1.3) warn about a version mismatch.
+const VK_API_VERSION: u32 = vk::API_VERSION_1_2;
+
+#[cfg(debug_assertions)]
+const VALIDATION_LAYERS: &[&CStr] = &[c"VK_LAYER_KHRONOS_validation"];
+
+const DEVICE_EXTENSIONS: &[&CStr] = &[
+    khr::swapchain::NAME,
+    #[cfg(target_vendor = "apple")]
+    khr::portability_subset::NAME,
+];
+
+/// Optional, enabled only when the device supports both.
+const PRESENT_WAIT_EXTENSIONS: &[&CStr] = &[khr::present_id::NAME, khr::present_wait::NAME];
+
+pub struct Context {
+    pub instance: vk::Instance,
+    pub surface: vk::SurfaceKHR,
+
+    pub physical_device: vk::PhysicalDevice,
+    pub device: super::Device,
+
+    pub graphics_family: u32,
+    pub present_queue: vk::Queue,
+    pub present_family: u32,
+
+    pub present_wait: bool,
+    pub indirect_draw: IndirectDrawFeatures,
+
+    #[cfg(debug_assertions)]
+    debug_messenger: vk::DebugUtilsMessengerEXT,
+
+    pub gpu_name: String,
+    pub api_version: String,
+}
+
+impl Context {
+    pub fn new(window: &Window) -> Result<Self, ContextError> {
+        #[cfg(target_os = "android")]
+        let required = [
+            khr::surface::NAME.as_ptr(),
+            khr::android_surface::NAME.as_ptr(),
+        ];
+        #[cfg(target_os = "ios")]
+        let required = [
+            khr::surface::NAME.as_ptr(),
+            pyronyx::ext::metal_surface::NAME.as_ptr(),
+        ];
+        #[cfg(not(mobile))]
+        let required = get_required_extensions(window.display_handle()?.as_raw())?;
+        #[allow(unused_mut)]
+        let mut extensions = required.to_vec();
+
+        // The loader only lists MoltenVK, a portability implementation, when
+        // asked; iOS links MoltenVK directly, with no loader.
+        #[cfg(target_os = "macos")]
+        extensions.push(khr::portability_enumeration::NAME.as_ptr());
+
+        #[cfg(debug_assertions)]
+        let validation_available = check_validation_layer_support();
+
+        #[cfg(debug_assertions)]
+        if validation_available {
+            use pyronyx::ext;
+
+            extensions.push(ext::debug_utils::NAME.as_ptr());
+        }
+
+        #[cfg(debug_assertions)]
+        let layers: &[&CStr] = if validation_available {
+            VALIDATION_LAYERS
+        } else {
+            tracing::warn!(
+                "Vulkan validation layers not available - install the Vulkan SDK for debug diagnostics"
+            );
+            &[]
+        };
+
+        #[cfg(not(debug_assertions))]
+        let layers: &[&CStr] = &[];
+
+        let layer_names: Vec<*const c_char> = layers.iter().map(|layer| layer.as_ptr()).collect();
+
+        let app_info = vk::ApplicationInfo {
+            application_name: VK_APP_NAME.as_ptr(),
+            application_version: VK_APP_VERSION,
+            engine_name: VK_ENGINE_NAME.as_ptr(),
+            engine_version: VK_ENGINE_VERSION,
+            api_version: VK_API_VERSION,
+            ..Default::default()
+        };
+
+        let instance_info = vk::InstanceCreateInfo {
+            application_info: &app_info,
+            enabled_extension_count: extensions.len() as u32,
+            enabled_extension_names: extensions.as_ptr(),
+
+            #[cfg(target_os = "macos")]
+            flags: vk::InstanceCreateFlags::EnumeratePortabilityKHR,
+
+            enabled_layer_count: layer_names.len() as u32,
+            enabled_layer_names: layer_names.as_ptr(),
+            ..Default::default()
+        };
+
+        #[cfg(debug_assertions)]
+        let mut debug_create_info = populate_debug_messenger_create_info();
+
+        #[cfg(debug_assertions)]
+        let instance_info = instance_info.next(&mut debug_create_info);
+
+        let instance = unsafe { vk::Instance::create(&instance_info, None)? };
+
+        #[cfg(debug_assertions)]
+        let debug_messenger = if validation_available {
+            instance.create_debug_utils_messenger(&populate_debug_messenger_create_info(), None)?
+        } else {
+            vk::DebugUtilsMessengerEXT::null()
+        };
+
+        let surface = window_surface(&instance, window)?;
+
+        let (physical_device, graphics_family, present_family) =
+            pick_physical_device(&instance, surface)?;
+
+        let (gpu_name, api_version) = {
+            let props = physical_device.get_properties();
+            let name = device_name(&props);
+            let v = props.api_version;
+            let ver = format!(
+                "Vulkan {}.{}.{}",
+                vk::api_version_major(v),
+                vk::api_version_minor(v),
+                vk::api_version_patch(v)
+            );
+            (name, ver)
+        };
+        tracing::info!("GPU: {gpu_name} ({api_version})");
+
+        let queue_priority = 1.0f32;
+
+        let queue_create_infos: &[_] = if graphics_family == present_family {
+            &[vk::DeviceQueueCreateInfo {
+                queue_family_index: graphics_family,
+                queue_priorities: &queue_priority,
+                queue_count: 1,
+                ..Default::default()
+            }]
+        } else {
+            &[
+                vk::DeviceQueueCreateInfo {
+                    queue_family_index: graphics_family,
+                    queue_priorities: &queue_priority,
+                    queue_count: 1,
+                    ..Default::default()
+                },
+                vk::DeviceQueueCreateInfo {
+                    queue_family_index: present_family,
+                    queue_priorities: &queue_priority,
+                    queue_count: 1,
+                    ..Default::default()
+                },
+            ]
+        };
+
+        let indirect_draw = IndirectDrawFeatures {
+            count: supports_draw_indirect_count(&physical_device),
+            multi_draw: physical_device.get_features().multi_draw_indirect == vk::TRUE,
+        };
+        tracing::info!("Indirect draws: {indirect_draw:?}");
+        let enabled_features = vk::PhysicalDeviceFeatures {
+            multi_draw_indirect: indirect_draw.multi_draw.into(),
+            draw_indirect_first_instance: vk::TRUE,
+            depth_clamp: physical_device.get_features().depth_clamp,
+            ..Default::default()
+        };
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features {
+            draw_indirect_count: vk::TRUE,
+            ..Default::default()
+        };
+
+        let present_wait = supports_present_wait(&physical_device);
+        tracing::info!("VK_KHR_present_wait: {present_wait}");
+
+        let optional_extensions = if present_wait {
+            PRESENT_WAIT_EXTENSIONS
+        } else {
+            &[]
+        };
+        let device_extension_names: Vec<*const c_char> = DEVICE_EXTENSIONS
+            .iter()
+            .chain(optional_extensions)
+            .map(|ext| ext.as_ptr())
+            .collect();
+
+        let mut present_id_features = vk::PhysicalDevicePresentIdFeaturesKHR {
+            present_id: vk::TRUE,
+            ..Default::default()
+        };
+        let mut present_wait_features = vk::PhysicalDevicePresentWaitFeaturesKHR {
+            present_wait: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut device_info = vk::DeviceCreateInfo {
+            queue_create_info_count: queue_create_infos.len() as u32,
+            queue_create_infos: queue_create_infos.as_ptr(),
+            enabled_extension_count: device_extension_names.len() as u32,
+            enabled_extension_names: device_extension_names.as_ptr(),
+            enabled_features: &enabled_features,
+            ..Default::default()
+        };
+        // Only a 1.2 device takes the struct, so it's chained only with the count.
+        if indirect_draw.count {
+            device_info = device_info.next(&mut vk12_features);
+        }
+        if present_wait {
+            device_info = device_info
+                .next(&mut present_id_features)
+                .next(&mut present_wait_features);
+        }
+
+        let device = unsafe { physical_device.create_device(&device_info, None, &instance)? };
+
+        let graphics_queue = unsafe { device.get_device_queue(graphics_family, 0) };
+        let present_queue = unsafe { device.get_device_queue(present_family, 0) };
+
+        let allocator = Allocator::new(&AllocatorCreateDesc {
+            instance: instance.clone(),
+            device: device.clone(),
+            physical_device,
+            debug_settings: Default::default(),
+            buffer_device_address: false,
+            allocation_sizes: Default::default(),
+        })?;
+
+        let pool_info = vk::CommandPoolCreateInfo {
+            flags: vk::CommandPoolCreateFlags::ResetCommandBuffer,
+            queue_family_index: graphics_family,
+            ..Default::default()
+        };
+        let command_pool = device.create_command_pool(&pool_info, None)?;
+
+        Ok(Self {
+            instance,
+            surface,
+            physical_device,
+            device: super::Device::new(
+                device,
+                &physical_device,
+                allocator,
+                graphics_queue,
+                command_pool,
+            ),
+            graphics_family,
+            present_queue,
+            present_family,
+            present_wait,
+            indirect_draw,
+            #[cfg(debug_assertions)]
+            debug_messenger,
+            gpu_name,
+            api_version,
+        })
+    }
+
+    /// Destroys the surface while Android has taken the native window away.
+    pub fn destroy_surface(&mut self) {
+        self.instance.destroy_surface(self.surface, None);
+        self.surface = vk::SurfaceKHR::null();
+    }
+
+    /// A surface for the native window Android hands back on resume.
+    pub fn recreate_surface(&mut self, window: &Window) -> Result<(), ContextError> {
+        self.surface = window_surface(&self.instance, window)?;
+        Ok(())
+    }
+
+    pub(super) fn queues(&self) -> super::Queues {
+        super::Queues {
+            graphics: self.device.queue,
+            present: self.present_queue,
+        }
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy();
+
+            #[cfg(debug_assertions)]
+            if self.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
+                self.instance
+                    .destroy_debug_utils_messenger(self.debug_messenger, None);
+            }
+
+            self.instance.destroy_surface(self.surface, None);
+            self.instance.destroy(None);
+        }
+    }
+}
+
+fn pick_physical_device(
+    instance: &vk::Instance,
+    surface: vk::SurfaceKHR,
+) -> Result<(vk::PhysicalDevice, u32, u32), ContextError> {
+    let devices = unsafe { instance.enumerate_physical_devices()? };
+
+    let mut candidates: Vec<_> = devices
+        .into_iter()
+        .filter_map(|pd| {
+            let (gf, pf) = find_queue_families(&pd, surface)?;
+            let props = pd.get_properties();
+            // The chunk pass indexes each section's meta by `firstInstance`.
+            let missing = if !supports_extensions(&pd, DEVICE_EXTENSIONS) {
+                Some("a required extension")
+            } else if pd.get_features().draw_indirect_first_instance != vk::TRUE {
+                Some("drawIndirectFirstInstance")
+            } else {
+                None
+            };
+            if let Some(missing) = missing {
+                tracing::info!("Skipping {}: no {missing}", device_name(&props));
+                return None;
+            }
+            let score = match props.device_type {
+                vk::PhysicalDeviceType::DiscreteGpu => 100,
+                vk::PhysicalDeviceType::IntegratedGpu => 50,
+                _ => 10,
+            };
+            Some((pd, gf, pf, score))
+        })
+        .collect();
+
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.3));
+
+    candidates
+        .into_iter()
+        .next()
+        .map(|(pd, gf, pf, _)| (pd, gf, pf))
+        .ok_or(ContextError::NoSuitableGpu)
+}
+
+fn device_name(props: &vk::PhysicalDeviceProperties) -> String {
+    unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn supports_extensions(device: &vk::PhysicalDevice, names: &[&CStr]) -> bool {
+    let available = device
+        .enumerate_device_extension_properties(None)
+        .unwrap_or_default();
+    names.iter().all(|&required| {
+        available
+            .iter()
+            .any(|ext| unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) == required })
+    })
+}
+
+fn window_surface(
+    instance: &vk::Instance,
+    window: &Window,
+) -> Result<vk::SurfaceKHR, ContextError> {
+    let window_handle = window.window_handle()?.as_raw();
+    // TODO: pyronyx 0.5.0's Android arm of `create_surface` doesn't compile
+    // (it passes the `c_void` window where `ANativeWindow` is expected), so
+    // Android builds its surface here, without pyronyx's `rwh_06` feature.
+    #[cfg(target_os = "android")]
+    {
+        use pyronyx::khr::android_surface::AndroidSurfaceInstance;
+        let raw_window_handle::RawWindowHandle::AndroidNdk(handle) = window_handle else {
+            return Err(raw_window_handle::HandleError::NotSupported.into());
+        };
+        let create_info = vk::AndroidSurfaceCreateInfoKHR {
+            window: handle.a_native_window.as_ptr().cast(),
+            ..Default::default()
+        };
+        Ok(instance.create_android_surface(&create_info, None)?)
+    }
+    // pyronyx 0.5.0's `create_surface` has no UiKit arm; this is its AppKit
+    // one, on the view's Metal layer.
+    #[cfg(target_os = "ios")]
+    {
+        use pyronyx::ext::metal_surface::MetalSurfaceInstance;
+        let raw_window_handle::RawWindowHandle::UiKit(handle) = window_handle else {
+            return Err(raw_window_handle::HandleError::NotSupported.into());
+        };
+        // SAFETY: winit's view is a live `UIView` while the window exists,
+        // and `into_raw` hands the layer's ownership to the surface.
+        let layer = unsafe { raw_window_metal::Layer::from_ui_view(handle.ui_view) };
+        let create_info = vk::MetalSurfaceCreateInfoEXT {
+            layer: layer.into_raw().as_ptr().cast(),
+            ..Default::default()
+        };
+        Ok(instance.create_metal_surface(&create_info, None)?)
+    }
+    #[cfg(not(mobile))]
+    Ok(create_surface(
+        instance,
+        window.display_handle()?.as_raw(),
+        window_handle,
+    )?)
+}
+
+fn supports_draw_indirect_count(device: &vk::PhysicalDevice) -> bool {
+    if device.get_properties().api_version < vk::API_VERSION_1_2 {
+        return false;
+    }
+    let mut vk12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().next(&mut vk12);
+    device.get_features2(&mut features);
+    vk12.draw_indirect_count == vk::TRUE
+}
+
+fn supports_present_wait(device: &vk::PhysicalDevice) -> bool {
+    if !supports_extensions(device, PRESENT_WAIT_EXTENSIONS) {
+        return false;
+    }
+    if device.fns().v1_1.get_physical_device_features2.is_none() {
+        return false;
+    }
+
+    let mut present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+    let mut present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .next(&mut present_id)
+        .next(&mut present_wait);
+    device.get_features2(&mut features);
+
+    present_id.present_id == vk::TRUE && present_wait.present_wait == vk::TRUE
+}
+
+fn find_queue_families(device: &vk::PhysicalDevice, surface: vk::SurfaceKHR) -> Option<(u32, u32)> {
+    let families = device.get_queue_family_properties();
+
+    let mut graphics = None;
+    let mut present = None;
+
+    for (i, family) in families.iter().enumerate() {
+        let i = i as u32;
+
+        if family.queue_flags.contains(vk::QueueFlags::Graphics) {
+            graphics = Some(i);
+        }
+
+        if device.get_surface_support(i, surface).unwrap_or(false) {
+            present = Some(i);
+        }
+
+        if graphics.is_some() && present.is_some() {
+            break;
+        }
+    }
+
+    match (graphics, present) {
+        (Some(g), Some(p)) => Some((g, p)),
+        _ => None,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn check_validation_layer_support() -> bool {
+    let available = vk::enumerate_instance_layer_properties().unwrap_or_default();
+    VALIDATION_LAYERS.iter().all(|&layer| {
+        available.iter().any(|props| {
+            let name = unsafe { CStr::from_ptr(props.layer_name.as_ptr()) };
+            name == layer
+        })
+    })
+}
+
+#[cfg(debug_assertions)]
+fn populate_debug_messenger_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+    vk::DebugUtilsMessengerCreateInfoEXT {
+        message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::Error
+            | vk::DebugUtilsMessageSeverityFlagsEXT::Warning,
+        message_type: vk::DebugUtilsMessageTypeFlagsEXT::General
+            | vk::DebugUtilsMessageTypeFlagsEXT::Validation
+            | vk::DebugUtilsMessageTypeFlagsEXT::Performance,
+        pfn_user_callback: Some(vulkan_debug_callback),
+        ..Default::default()
+    }
+}
+
+#[cfg(debug_assertions)]
+extern "system" fn vulkan_debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _ty: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _user_data: *mut std::ffi::c_void,
+) -> u32 {
+    let msg = unsafe { CStr::from_ptr((*data).message) }.to_string_lossy();
+    match severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::Error => tracing::error!("[Vulkan] {msg}"),
+        vk::DebugUtilsMessageSeverityFlagsEXT::Warning => tracing::warn!("[Vulkan] {msg}"),
+        _ => tracing::debug!("[Vulkan] {msg}"),
+    }
+    0
+}

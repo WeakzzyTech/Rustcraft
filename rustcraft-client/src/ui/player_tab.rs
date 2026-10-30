@@ -1,0 +1,294 @@
+//! Ported 1:1 from vanilla `PlayerTabOverlay.extractRenderState`
+//! (reference/26.1/decompiled/.../PlayerTabOverlay.java:103-204).
+
+use crate::entity::EntityStore;
+use crate::player::tab_list::{TabList, TabListPlayer};
+use crate::renderer::pipelines::menu_overlay::{MenuElement, SpriteId};
+use crate::ui::chat::wrap_spans;
+use crate::ui::common::{FONT_SIZE, LINE_HEIGHT};
+use crate::ui::hud::Scoreboard;
+use crate::ui::text::{TextSpan, font_spans};
+
+const MAX_ROWS_PER_COL: usize = 20;
+const HEAD_COL_W: i32 = 9;
+const SPECTATOR_GAME_MODE: u8 = 3;
+
+const BG_BACKDROP: [f32; 4] = [0.0, 0.0, 0.0, 0.5]; // Integer.MIN_VALUE (0x80000000)
+const BG_ROW: [f32; 4] = [1.0, 1.0, 1.0, 0x20 as f32 / 255.0]; // 0x20FFFFFF
+
+/// `spans_width(spans, FONT_SIZE)` must return the width in pixels at 1x GUI
+/// scale.
+pub fn build_player_tab_overlay(
+    elements: &mut Vec<MenuElement>,
+    screen_w: f32,
+    tab_list: &TabList,
+    scoreboard: &Scoreboard,
+    show_heads: bool,
+    gs: f32,
+    spans_width: crate::ui::common::SpansWidthFn<'_>,
+) {
+    let players = tab_list.sorted_listed(scoreboard);
+    if players.is_empty() {
+        return;
+    }
+
+    let gw = (screen_w / gs).floor();
+
+    let display_names: Vec<Vec<TextSpan>> = players
+        .iter()
+        .map(|p| display_name_for(p, scoreboard))
+        .collect();
+    let max_name_w: i32 = display_names
+        .iter()
+        .map(|n| spans_width(n, FONT_SIZE).ceil() as i32)
+        .max()
+        .unwrap_or(0);
+
+    let slots = players.len();
+    let mut rows = slots;
+    let mut cols = 1usize;
+    while rows > MAX_ROWS_PER_COL {
+        cols += 1;
+        rows = slots.div_ceil(cols);
+    }
+
+    let cols_i = cols as i32;
+    let head_w = if show_heads { HEAD_COL_W } else { 0 };
+    let slot_width = ((cols_i * (head_w + max_name_w + 13)).min(gw as i32 - 50) / cols_i).max(1);
+    let grid_w = slot_width * cols_i + (cols_i - 1) * 5;
+    let xxo = (gw as i32) / 2 - grid_w / 2;
+    let cx = (gw as i32) / 2;
+
+    let width0 = |spans: &[TextSpan]| spans_width(spans, FONT_SIZE);
+    let wrap = |text: &Vec<TextSpan>| wrap_lines(text, gw - 50.0, &width0);
+    let header_lines = tab_list.header.as_ref().map(wrap);
+    let footer_lines = tab_list.footer.as_ref().map(wrap);
+
+    let mut max_line_w = grid_w;
+    for lines in [&header_lines, &footer_lines].into_iter().flatten() {
+        for l in lines {
+            max_line_w = max_line_w.max(width0(l).ceil() as i32);
+        }
+    }
+
+    let push_fill =
+        |elements: &mut Vec<MenuElement>, x1: i32, y1: i32, x2: i32, y2: i32, color: [f32; 4]| {
+            elements.push(MenuElement::Rect {
+                x: x1 as f32 * gs,
+                y: y1 as f32 * gs,
+                w: (x2 - x1) as f32 * gs,
+                h: (y2 - y1) as f32 * gs,
+                corner_radius: 0.0,
+                color,
+            });
+        };
+    let push_spans = |elements: &mut Vec<MenuElement>, spans: Vec<TextSpan>, x: i32, y: i32| {
+        elements.push(MenuElement::TextSpans {
+            x: x as f32 * gs,
+            y: y as f32 * gs,
+            spans,
+            scale: FONT_SIZE * gs,
+            centered: false,
+        });
+    };
+    let push_image =
+        |elements: &mut Vec<MenuElement>, x: i32, y: i32, w: i32, h: i32, sprite: SpriteId| {
+            elements.push(MenuElement::Image {
+                x: x as f32 * gs,
+                y: y as f32 * gs,
+                w: w as f32 * gs,
+                h: h as f32 * gs,
+                sprite,
+                tint: [1.0, 1.0, 1.0, 1.0],
+            });
+        };
+
+    let draw_text_block = |elements: &mut Vec<MenuElement>, lines: &[Vec<TextSpan>], top: i32| {
+        push_fill(
+            elements,
+            cx - max_line_w / 2 - 1,
+            top - 1,
+            cx + max_line_w / 2 + 1,
+            top + lines.len() as i32 * LINE_HEIGHT,
+            BG_BACKDROP,
+        );
+        for (i, line) in lines.iter().enumerate() {
+            let lw = width0(line).ceil() as i32;
+            push_spans(
+                elements,
+                line.clone(),
+                cx - lw / 2,
+                top + i as i32 * LINE_HEIGHT,
+            );
+        }
+    };
+
+    let mut yyo: i32 = 10;
+    if let Some(lines) = &header_lines {
+        draw_text_block(elements, lines, yyo);
+        yyo += lines.len() as i32 * LINE_HEIGHT + 1;
+    }
+
+    push_fill(
+        elements,
+        cx - max_line_w / 2 - 1,
+        yyo - 1,
+        cx + max_line_w / 2 + 1,
+        yyo + rows as i32 * 9,
+        BG_BACKDROP,
+    );
+
+    for i in 0..slots {
+        let col = (i / rows) as i32;
+        let row = (i % rows) as i32;
+        let row_left = xxo + col * slot_width + col * 5;
+        let yo = yyo + row * 9;
+
+        push_fill(
+            elements,
+            row_left,
+            yo,
+            row_left + slot_width,
+            yo + 8,
+            BG_ROW,
+        );
+        let info = players[i];
+        if show_heads {
+            // TODO: vanilla hides the hat layer per `showHat` and flips the
+            // face for Dinnerbone/Grumm; faces here always carry the hat.
+            elements.push(MenuElement::SkinFace {
+                x: row_left as f32 * gs,
+                y: yo as f32 * gs,
+                size: 8.0 * gs,
+                uuid: info.uuid.to_string(),
+                tint: [1.0; 4],
+            });
+        }
+        let mut spans = display_names[i].clone();
+        if info.game_mode == SPECTATOR_GAME_MODE {
+            // Vanilla `decorateName`: spectators are italicized, nothing else.
+            for span in &mut spans {
+                span.italic = true;
+            }
+        }
+        push_spans(elements, spans, row_left + head_w, yo);
+        push_image(
+            elements,
+            row_left + slot_width - 11,
+            yo,
+            10,
+            8,
+            ping_sprite(info.latency),
+        );
+    }
+
+    if let Some(lines) = &footer_lines {
+        yyo += rows as i32 * 9 + 1;
+        draw_text_block(elements, lines, yyo);
+    }
+}
+
+/// Vanilla `Font.split` on the header or footer: it splits the decomposed
+/// text, so a legacy code is never parted from its letter.
+fn wrap_lines(
+    text: &[TextSpan],
+    max_w: f32,
+    width0: &dyn Fn(&[TextSpan]) -> f32,
+) -> Vec<Vec<TextSpan>> {
+    wrap_spans(&font_spans(text), max_w, width0)
+}
+
+fn display_name_for(p: &TabListPlayer, scoreboard: &Scoreboard) -> Vec<TextSpan> {
+    scoreboard.player_name(&p.name, p.display_name.as_deref())
+}
+
+pub struct PlayerNameplates<'a> {
+    pub entity_store: &'a EntityStore,
+    pub tab_list: &'a TabList,
+    pub scoreboard: &'a Scoreboard,
+    pub local_uuid: uuid::Uuid,
+    pub partial_tick: f32,
+    pub gs: f32,
+    pub camera_pos: glam::DVec3,
+    pub project: &'a dyn Fn(glam::DVec3) -> Option<(f32, f32)>,
+}
+
+// TODO: vanilla renders name tags as world-space billboards (0.025 scale,
+// shrinking with distance, 25% black backdrop, a see-through pass behind
+// walls, sneak dimming, no shadow) and honors team nametagVisibility; this
+// screen-space projection is an approximation until a world-space text path
+// exists.
+pub fn build_player_nameplates(elements: &mut Vec<MenuElement>, nameplates: PlayerNameplates<'_>) {
+    for entity in nameplates.entity_store.living.values() {
+        let Some(uuid) = entity.player_uuid else {
+            continue;
+        };
+        if uuid == nameplates.local_uuid {
+            continue;
+        }
+        let Some(player) = nameplates.tab_list.players.get(&uuid) else {
+            continue;
+        };
+        let pos = entity
+            .prev_position
+            .lerp(entity.position, nameplates.partial_tick as f64)
+            // Vanilla anchors at the pose bounding-box height + 0.5.
+            + glam::DVec3::Y * if entity.is_crouching { 2.0 } else { 2.3 };
+        let max_distance = if entity.is_crouching { 32.0 } else { 64.0 };
+        if (*pos - nameplates.camera_pos).length_squared() > max_distance * max_distance {
+            continue;
+        }
+        let Some((x, y)) = (nameplates.project)(*pos) else {
+            continue;
+        };
+        elements.push(MenuElement::TextSpans {
+            x,
+            y: y - 4.0 * nameplates.gs,
+            // The tab-list display name is tab-only in vanilla; name tags
+            // always use the team-formatted profile name.
+            spans: nameplates.scoreboard.player_name(&player.name, None),
+            scale: FONT_SIZE * nameplates.gs,
+            centered: true,
+        });
+    }
+}
+
+fn ping_sprite(latency: i32) -> SpriteId {
+    if latency < 0 {
+        SpriteId::PingUnknown
+    } else if latency < 150 {
+        SpriteId::Ping5
+    } else if latency < 300 {
+        SpriteId::Ping4
+    } else if latency < 600 {
+        SpriteId::Ping3
+    } else if latency < 1000 {
+        SpriteId::Ping2
+    } else {
+        SpriteId::Ping1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_lines_wrap_the_decoded_text() {
+        let width = |spans: &[TextSpan]| {
+            spans
+                .iter()
+                .map(|span| span.text.chars().count())
+                .sum::<usize>() as f32
+                * 6.0
+        };
+        let header = [TextSpan::new("\u{00a7}caaaa bbbb".to_owned(), [1.0; 4])];
+        let lines = wrap_lines(&header, 30.0, &width);
+        let red = crate::ui::common::rgb(0xff5555);
+        assert_eq!(lines.len(), 2);
+        for (line, text) in lines.iter().zip(["aaaa", "bbbb"]) {
+            assert_eq!(crate::ui::text::span_text(line), text);
+            assert!(line.iter().all(|span| span.color == red));
+        }
+    }
+}

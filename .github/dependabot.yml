@@ -1,0 +1,43 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      azalea:
+        patterns:
+          - "azalea-*"
+      vulkan:
+        patterns:
+          - "ash"
+          - "ash-window"
+          - "gpu-allocator"
+      tauri:
+        patterns:
+          - "tauri"
+          - "tauri-*"
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-*"
+          - "@types/react*"
+
+  # Monday, so a bad steel bump has the whole week to be caught or fixed
+  # upstream before Sunday's snapshot picks up master.
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday

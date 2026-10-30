@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rustcraft
+Comment=Minecraft client
+Exec=rustcraft-client
+Icon=rustcraft
+Categories=Game;
+Terminal=false

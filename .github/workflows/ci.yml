@@ -1,0 +1,325 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # What a pull request touches, so it skips the checks it can't affect: a
+  # docs-only change builds nothing, and the launcher's jobs only run for it
+  # and the crates it uses. Pushes and manual runs check everything.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ github.event_name != 'pull_request' || steps.code.outputs.code == 'true' }}
+      launcher: ${{ github.event_name != 'pull_request' || steps.launcher.outputs.launcher == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        id: code
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!LICENSE*'
+
+      - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        id: launcher
+        with:
+          filters: |
+            launcher:
+              - 'rustcraft-launcher/**'
+              - 'rustcraft-auth/**'
+              - 'rustcraft-dirs/**'
+              - 'rustcraft-install/**'
+              - 'rustcraft-protocol/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - '.github/workflows/ci.yml'
+
+  # Desktop clippy never compiles the `cfg(target_os = "android")` code.
+  android:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: android
+
+      - name: Add the Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk@4.1.2 --locked
+
+      # The runner image ships an NDK and names it in ANDROID_NDK_LATEST_HOME.
+      - name: Clippy
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a clippy -p rustcraft-android -- -D warnings
+
+  # The same for `cfg(target_os = "ios")`.
+  ios:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: ios
+
+      - name: Add the iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - uses: actions/cache@v4
+        with:
+          path: target/moltenvk
+          key: moltenvk-${{ hashFiles('tools/fetch_moltenvk.py') }}
+
+      # shaderc is built for the runner against the SDK; the iOS build links
+      # MoltenVK as its Vulkan.
+      - name: Clippy
+        run: SHADERC_LIB_DIR="$VULKAN_SDK/lib" VULKAN_SDK="$(python3 tools/fetch_moltenvk.py ios)" cargo clippy -p rustcraft-ios --target aarch64-apple-ios -- -D warnings
+
+  fmt:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules too: `cargo fmt --all` resolves SteelMC's path dependencies.
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - run: just ci-fmt
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: lint
+
+      - run: just ci-lint
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test
+
+      - run: just ci-test
+
+  # SteelMC on its own, as it's the slowest build; its test boots a real world,
+  # the only check that steel actually starts.
+  singleplayer:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: singleplayer
+
+      - name: Pin the steel revision
+        id: steel
+        run: echo "rev=$(git -C third_party/SteelMC rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Steel's build scripts write generated source and the extracted Minecraft
+      # assets into its own source tree, which the cargo cache does not cover.
+      - name: Cache the generated steel source
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/SteelMC/steel-core/src/behavior/generated
+            third_party/SteelMC/steel-core/src/entity/generated
+            third_party/SteelMC/steel-registry/src/generated
+            third_party/SteelMC/steel-utils/src/generated
+            third_party/SteelMC/steel-utils/build_assets
+            third_party/SteelMC/steel-worldgen/src/generated
+          key: steel-generated-${{ steps.steel.outputs.rev }}
+
+      - run: just ci-singleplayer
+
+  pr-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check PR template and labeler agree
+        # The labeler matches checkbox text exactly, so a reworded box silently
+        # stops applying its label.
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          def read(path):
+              # Normalized, so a CRLF checkout doesn't look like a missing section.
+              return pathlib.Path(path).read_text(encoding="utf-8").replace("\r\n", "\n")
+
+          template = read(".github/PULL_REQUEST_TEMPLATE.md")
+          workflow = read(".github/workflows/pr-tags.yml")
+
+          section = re.search(r"## Type of change\n(.*?)(?=\n## |\Z)", template, re.S)
+          if section is None:
+              sys.exit("::error::PULL_REQUEST_TEMPLATE.md has no '## Type of change' section")
+
+          boxes = set(re.findall(r"^- \[ \] (.+)$", section.group(1), re.M))
+          mapped = set(re.findall(r'text:\s*"([^"]+)"', workflow))
+
+          drift = [f"checkbox {t!r} has no label in pr-tags.yml" for t in sorted(boxes - mapped)]
+          drift += [f"pr-tags.yml maps {t!r}, which is not a checkbox" for t in sorted(mapped - boxes)]
+          for problem in drift:
+              print(f"::error::{problem}")
+          if drift:
+              sys.exit(1)
+          print(f"{len(boxes)} checkboxes match their label mappings")
+          PY
+
+  launcher-frontend:
+    needs: changes
+    if: needs.changes.outputs.launcher == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Format check
+        run: pnpm --filter rustcraft-launcher format:check
+
+      - name: Lint
+        run: pnpm --filter rustcraft-launcher lint
+
+      - name: Type check
+        run: pnpm --filter rustcraft-launcher exec tsc --noEmit
+
+  launcher:
+    needs: changes
+    if: needs.changes.outputs.launcher == 'true'
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: launcher
+          cache-on-failure: true
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Format check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt -p rustcraft-launcher -- --check
+
+      - name: Clippy
+        run: cargo clippy -p rustcraft-launcher --release --all-targets --all-features -- -D warnings
+
+      - name: Check bindings are up to date
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run -p rustcraft-launcher --quiet --bin generate-bindings
+          if ! git diff --exit-code -- ./rustcraft-launcher/src/bindings; then
+            echo "::error::rustcraft-launcher/src/bindings is stale. Run 'cargo run -p rustcraft-launcher --bin generate-bindings' and commit."
+            exit 1
+          fi
+
+  # The one required check: it passes once every other job has passed or been
+  # skipped, so jobs can be split or skipped without touching the ruleset.
+  ci:
+    if: always()
+    needs:
+      - changes
+      - android
+      - ios
+      - fmt
+      - lint
+      - test
+      - singleplayer
+      - pr-template
+      - launcher-frontend
+      - launcher
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

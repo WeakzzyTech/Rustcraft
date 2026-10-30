@@ -1,0 +1,4 @@
+packages:
+  - "rustcraft-launcher"
+allowBuilds:
+  unrs-resolver: false

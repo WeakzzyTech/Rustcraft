@@ -1,0 +1,13 @@
+[package]
+name = "rustcraft-android"
+description = "Android entry point for the Rustcraft client."
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustcraft-client = { path = "../rustcraft-client", default-features = false }

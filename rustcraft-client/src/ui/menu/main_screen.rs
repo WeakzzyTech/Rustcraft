@@ -1,0 +1,487 @@
+use super::*;
+
+impl MainMenu {
+    /// The title screen in the selected theme. Branching here keeps the
+    /// Friends backdrop, which re-runs this builder, on the same theme; the
+    /// theme wipe itself is driven by the dispatcher so the backdrop can't
+    /// commit a switch.
+    pub(super) fn build_main(
+        &mut self,
+        screen_w: f32,
+        screen_h: f32,
+        input: &MenuInput,
+        text_width_fn: impl Fn(&str, f32) -> f32,
+        key_bindings: &KeyBindings,
+    ) -> MainMenuResult {
+        match self.theme {
+            PanoramaTheme::Rustcraft => {
+                self.build_main_rustcraft(screen_w, screen_h, input, text_width_fn, key_bindings)
+            }
+            PanoramaTheme::Java => {
+                self.build_main_vanilla(screen_w, screen_h, input, text_width_fn, key_bindings)
+            }
+            PanoramaTheme::Bedrock => {
+                self.build_main_bedrock(screen_w, screen_h, input, text_width_fn, key_bindings)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build_main_rustcraft(
+        &mut self,
+        screen_w: f32,
+        screen_h: f32,
+        input: &MenuInput,
+        text_width_fn: impl Fn(&str, f32) -> f32,
+        key_bindings: &KeyBindings,
+    ) -> MainMenuResult {
+        let gs = self.gui_scale(screen_w, screen_h);
+        let cursor = input.cursor;
+        let clicked = input.clicked;
+
+        let mut elements = vec![MenuElement::BlurBackdrop];
+        let mut action = MenuAction::None;
+        let mut any_hovered = false;
+        let mut any_clicked = false;
+
+        let anim_t = self
+            .menu_open_time
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs_f32();
+        let panel_t = ease_out_cubic((anim_t / 2.0).min(1.0));
+
+        let accent: [f32; 4] = [0.57, 0.94, 0.73, 1.0];
+        let glass: [f32; 4] = [0.3, 0.32, 0.43, 0.76];
+        let glass_hover: [f32; 4] = [0.38, 0.41, 0.53, 0.82];
+        let text_col: [f32; 4] = [0.89, 0.90, 0.96, 0.93];
+        let text_bright: [f32; 4] = [0.94, 0.95, 0.98, 1.0];
+        let text_dim: [f32; 4] = [0.53, 0.56, 0.69, 0.79];
+        let text_disabled: [f32; 4] = [0.45, 0.47, 0.58, 0.62];
+        let icon_bright: [f32; 4] = [0.97, 0.98, 0.99, 1.0];
+        let icon_dim: [f32; 4] = [0.75, 0.77, 0.84, 0.6];
+        let icon_disabled: [f32; 4] = [0.7, 0.71, 0.78, 0.35];
+        let border: [f32; 4] = [1.0, 1.0, 1.0, 0.26];
+
+        struct BtnDef {
+            label: &'static str,
+            id: u8,
+            enabled: bool,
+        }
+        let buttons = [
+            BtnDef {
+                label: "Singleplayer",
+                id: 0,
+                enabled: true,
+            },
+            BtnDef {
+                label: "Multiplayer",
+                id: 1,
+                enabled: true,
+            },
+            BtnDef {
+                label: "Quit Game",
+                id: 2,
+                enabled: true,
+            },
+        ];
+
+        // Clamp by width too: past this the panel width clamp would bind and
+        // text scaled by height alone would outgrow the panel.
+        let s = (screen_h / 400.0).max(1.0).min(screen_w * 0.4 / 260.0);
+        let panel_w = (260.0 * s).min(screen_w * 0.4);
+        let panel_pad = 28.0 * s;
+        let panel_r = 14.0 * s;
+        let accent_bar_h = 3.0 * s;
+        let title_size = 40.0 * s;
+        let sub_size = 9.0 * s;
+        let content_w = panel_w - panel_pad * 2.0;
+        let btn_h = 36.0 * s;
+        let btn_gap = 5.0 * s;
+        let btn_r = 8.0 * s;
+        let font_size = 11.0 * s;
+        let accent_w = 3.0 * s;
+        let icon_size = 28.0 * s;
+        let icon_gap = 6.0 * s;
+        let icon_row_gap = icon_gap;
+
+        let header_h = accent_bar_h + 14.0 * s + title_size + 4.0 * s + sub_size + 18.0 * s;
+        let btns_total = buttons.len() as f32 * (btn_h + btn_gap) - btn_gap;
+        let icons_total = icon_size * 2.0 + icon_row_gap;
+        let panel_h = (panel_pad
+            + header_h
+            + 1.0
+            + 16.0 * s
+            + btns_total
+            + 16.0 * s
+            + icons_total
+            + panel_pad)
+            .min(screen_h * 0.9);
+        let panel_margin = (screen_w * 0.06).max(12.0);
+        let panel_start_x = -panel_w;
+        let panel_final_x = panel_margin;
+        let panel_x = panel_start_x + (panel_final_x - panel_start_x) * panel_t;
+        let panel_y = (screen_h - panel_h) / 2.0;
+        let btn_x = panel_x + panel_pad;
+
+        elements.push(MenuElement::FrostedRect {
+            x: panel_x,
+            y: panel_y,
+            w: panel_w,
+            h: panel_h,
+            corner_radius: panel_r,
+            tint: [0.055, 0.06, 0.13, 0.72],
+        });
+
+        let mut cy = panel_y + panel_pad;
+
+        elements.push(MenuElement::Rect {
+            x: btn_x,
+            y: cy,
+            w: 50.0 * s,
+            h: accent_bar_h,
+            corner_radius: accent_bar_h * 0.5,
+            color: [accent[0], accent[1], accent[2], 0.85],
+        });
+        cy += accent_bar_h + 14.0 * s;
+
+        let rustcraft_w = text_width_fn("Rustcraft", title_size);
+        elements.push(MenuElement::Text {
+            x: btn_x,
+            y: cy,
+            text: "Rustcraft".into(),
+            scale: title_size,
+            color: COL_WORDMARK,
+            centered: false,
+        });
+
+        let sub_x = btn_x + rustcraft_w + 8.0 * s;
+        let sub_y1 = cy + title_size - sub_size * 2.0 - 4.0 * s;
+        let sub_y2 = cy + title_size - sub_size - 1.0 * s;
+        let badge_t = ((anim_t - 2.0) / 0.3).clamp(0.0, 1.0);
+        let badge_scale = ease_out_cubic(badge_t);
+
+        let rust_w = text_width_fn("Rust", sub_size);
+        let badge_pad_x = 5.0 * s;
+        let badge_pad_y = 2.5 * s;
+        let badge_w = rust_w + badge_pad_x * 2.0;
+        let badge_h = sub_size + badge_pad_y * 2.0;
+        let badge_r = badge_h * 0.5;
+
+        if badge_t < 1.0 {
+            elements.push(MenuElement::Text {
+                x: sub_x,
+                y: sub_y1,
+                text: "Java".into(),
+                scale: sub_size,
+                color: text_dim,
+                centered: false,
+            });
+        }
+
+        if badge_t > 0.0 {
+            let bx = sub_x - badge_pad_x;
+            let by = sub_y1 - badge_pad_y;
+            let bw = badge_w * badge_scale;
+            elements.push(MenuElement::Rect {
+                x: bx,
+                y: by,
+                w: bw,
+                h: badge_h,
+                corner_radius: badge_r,
+                color: [accent[0], accent[1], accent[2], 0.95 * badge_scale],
+            });
+            if badge_t >= 0.5 {
+                let text_a = ((badge_t - 0.5) / 0.5).min(1.0);
+                elements.push(MenuElement::Text {
+                    x: sub_x,
+                    y: sub_y1,
+                    text: "Rust".into(),
+                    scale: sub_size,
+                    color: [0.05, 0.05, 0.1, text_a],
+                    centered: false,
+                });
+            }
+        }
+
+        elements.push(MenuElement::Text {
+            x: sub_x,
+            y: sub_y2,
+            text: "Edition".into(),
+            scale: sub_size,
+            color: text_dim,
+            centered: false,
+        });
+        cy += title_size + 18.0 * s;
+
+        elements.push(MenuElement::Rect {
+            x: btn_x,
+            y: cy,
+            w: content_w,
+            h: 1.0,
+            corner_radius: 0.5,
+            color: border,
+        });
+        cy += 1.0 + 16.0 * s;
+
+        // TODO: fold the bottom icon rows into the focus ring too (arrow-key
+        // nearest-rect navigation is still deferred).
+        self.focus_advance(input);
+        let mut ctx = self.make_focus_ctx(input);
+
+        for (i, def) in buttons.iter().enumerate() {
+            let by = cy + i as f32 * (btn_h + btn_gap);
+            let rect = [btn_x, by, content_w, btn_h];
+            let hovered = def.enabled && common::hit_test(cursor, rect);
+            let focused = ctx.focused(def.enabled, hovered);
+            any_hovered |= hovered;
+            // Keyboard focus shows the same highlight as hover (vanilla).
+            let active = hovered || focused;
+
+            elements.push(MenuElement::Rect {
+                x: rect[0],
+                y: rect[1],
+                w: rect[2],
+                h: rect[3],
+                corner_radius: btn_r,
+                color: if active { glass_hover } else { glass },
+            });
+
+            let bar_margin = btn_h * 0.18;
+            elements.push(MenuElement::Rect {
+                x: rect[0],
+                y: rect[1] + bar_margin,
+                w: accent_w,
+                h: rect[3] - bar_margin * 2.0,
+                corner_radius: accent_w * 0.5,
+                color: [
+                    accent[0],
+                    accent[1],
+                    accent[2],
+                    if !def.enabled {
+                        0.23
+                    } else if active {
+                        0.95
+                    } else {
+                        0.38
+                    },
+                ],
+            });
+
+            elements.push(MenuElement::Text {
+                x: rect[0] + 18.0 * s,
+                y: rect[1] + (rect[3] - font_size) / 2.0,
+                text: def.label.into(),
+                scale: font_size,
+                color: if !def.enabled {
+                    text_disabled
+                } else if active {
+                    text_bright
+                } else {
+                    text_col
+                },
+                centered: false,
+            });
+
+            if (clicked && hovered) || (focused && ctx.activate) {
+                any_clicked = true;
+                if def.id == 2 {
+                    action = MenuAction::Quit;
+                } else {
+                    match def.id {
+                        0 => {
+                            self.open_world_list(
+                                gs,
+                                &|t: &str| text_width_fn(t, common::FONT_SIZE * gs),
+                                key_bindings,
+                            );
+                        }
+                        1 => {
+                            self.set_screen(Screen::ServerList, key_bindings);
+                            self.scroll_offset = 0.0;
+                            self.selected_server = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let new_row_y = panel_y + panel_h - panel_pad - icon_size;
+        let icon_area_y = new_row_y - icon_size - icon_row_gap;
+        let icon_r = 7.0 * s;
+        let icon_scale = 13.0 * s;
+        let drop_style = DropdownStyle::new(gs);
+
+        let icon_btn =
+            |elements: &mut Vec<MenuElement>, bx: f32, by: f32, icon: char, enabled: bool| {
+                let hovered = common::hit_test(cursor, [bx, by, icon_size, icon_size]);
+                if hovered && enabled {
+                    elements.push(MenuElement::Rect {
+                        x: bx,
+                        y: by,
+                        w: icon_size,
+                        h: icon_size,
+                        corner_radius: icon_r,
+                        color: glass_hover,
+                    });
+                }
+                elements.push(MenuElement::Icon {
+                    x: bx + icon_size / 2.0,
+                    y: by + icon_size / 2.0,
+                    icon,
+                    scale: icon_scale,
+                    color: if !enabled {
+                        icon_disabled
+                    } else if hovered {
+                        icon_bright
+                    } else {
+                        icon_dim
+                    },
+                });
+                hovered
+            };
+
+        let bottom_icons: [(f32, char, bool); 4] = [
+            (btn_x, ICON_USER, true),
+            (btn_x + icon_size + icon_gap, ICON_LINK, true),
+            (btn_x + content_w - icon_size, ICON_GEAR, true),
+            (
+                btn_x + content_w - icon_size * 2.0 - icon_gap,
+                ICON_PAINTBRUSH,
+                true,
+            ),
+        ];
+
+        for &(bx, icon, enabled) in &bottom_icons {
+            let hovered = icon_btn(&mut elements, bx, icon_area_y, icon, enabled);
+            any_hovered |= enabled && hovered;
+
+            if enabled && clicked && hovered {
+                any_clicked = true;
+                match icon {
+                    ICON_USER => self.open_account(key_bindings),
+                    ICON_LINK => self.toggle_links(),
+                    ICON_GEAR => {
+                        self.open_options(key_bindings);
+                    }
+                    ICON_PAINTBRUSH => self.toggle_theme(),
+                    _ => {}
+                }
+            }
+        }
+
+        // Second row mirrors vanilla 26.2: friends, language and accessibility,
+        // centered. Signed out, Friends opens the sign-in screen instead.
+        let signed_in = self.access_token.is_some();
+        let friends_tip = if signed_in {
+            "Friends"
+        } else {
+            "Sign in to use friends"
+        };
+        let new_row_w = icon_size * 3.0 + icon_gap * 2.0;
+        let new_x0 = btn_x + (content_w - new_row_w) / 2.0;
+        let new_icons: [(f32, char, bool, &str); 3] = [
+            (new_x0, ICON_USERS, true, friends_tip),
+            (
+                new_x0 + icon_size + icon_gap,
+                ICON_LANGUAGE,
+                false,
+                "Language",
+            ),
+            (
+                new_x0 + (icon_size + icon_gap) * 2.0,
+                ICON_UNIVERSAL_ACCESS,
+                true,
+                "Accessibility Settings",
+            ),
+        ];
+
+        for &(bx, icon, enabled, tip) in &new_icons {
+            let hovered = icon_btn(&mut elements, bx, new_row_y, icon, enabled);
+            any_hovered |= enabled && hovered;
+
+            if hovered {
+                common::push_tooltip(&mut elements, cursor, screen_w, screen_h, gs, tip);
+            }
+
+            if enabled && clicked && hovered {
+                any_clicked = true;
+                match icon {
+                    ICON_USERS if signed_in => self.open_friends(key_bindings),
+                    ICON_USERS => self.open_account(key_bindings),
+                    ICON_LANGUAGE => {
+                        self.settings_back = Screen::Main;
+                        self.set_screen(Screen::OptionsLanguage, key_bindings);
+                    }
+                    ICON_UNIVERSAL_ACCESS => {
+                        self.settings_back = Screen::Main;
+                        self.set_screen(Screen::OptionsAccessibility, key_bindings);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Links open rightwards off their icon; the theme picker is at the far
+        // end of the row, so it right-aligns to its own icon instead.
+        let links_x = btn_x + icon_size + icon_gap;
+        self.push_links_dropdown(
+            &mut elements,
+            &mut any_hovered,
+            cursor,
+            clicked,
+            &drop_style,
+            [links_x, icon_area_y, icon_size, icon_size],
+            links_x,
+            icon_area_y - 2.0 * s,
+            140.0 * s,
+        );
+
+        let theme_x = btn_x + content_w - icon_size * 2.0 - icon_gap;
+        let theme_w = 120.0 * s;
+        self.push_theme_dropdown(
+            &mut elements,
+            &mut any_hovered,
+            cursor,
+            clicked,
+            &drop_style,
+            [theme_x, icon_area_y, icon_size, icon_size],
+            theme_x + icon_size - theme_w,
+            icon_area_y - 2.0 * s,
+            theme_w,
+        );
+
+        let footer_size = 8.0 * s;
+        let footer_pad = 8.0 * s;
+        let footer_y = screen_h - footer_pad - footer_size;
+        let footer_col = [0.4, 0.45, 0.6, 0.48];
+        elements.push(MenuElement::Text {
+            x: footer_pad,
+            y: footer_y,
+            text: self.version.clone(),
+            scale: footer_size,
+            color: footer_col,
+            centered: false,
+        });
+        let copy = format!("Rustcraft {}", crate::update::version());
+        let copy_w = text_width_fn(&copy, footer_size);
+        elements.push(MenuElement::Text {
+            x: screen_w - footer_pad - copy_w,
+            y: footer_y,
+            text: copy,
+            scale: footer_size,
+            color: footer_col,
+            centered: false,
+        });
+
+        self.finish_focus(&ctx);
+
+        MainMenuResult {
+            elements,
+            action,
+            cursor_pointer: any_hovered,
+            clicked_button: any_clicked,
+        }
+    }
+}

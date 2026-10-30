@@ -1,0 +1,2637 @@
+use std::collections::HashMap;
+
+use azalea_block::BlockState;
+use azalea_inventory::ItemStackData;
+use azalea_inventory::components::{
+    BlocksAttacks, ChargedProjectiles, Consumable, Equippable, Food, ItemUseAnimation,
+    KineticWeapon, MinimumAttackCharge, UseEffects,
+};
+use azalea_inventory::default_components::{DefaultableComponent, get_default_component};
+use azalea_protocol::packets::game::ServerboundGamePacket;
+pub use azalea_protocol::packets::game::s_interact::InteractionHand;
+use azalea_protocol::packets::game::s_player_action::{Action, ServerboundPlayerAction};
+use azalea_protocol::packets::game::s_set_carried_item::ServerboundSetCarriedItem;
+use azalea_protocol::packets::game::s_use_item::ServerboundUseItem;
+use azalea_protocol::packets::game::s_use_item_on::{BlockHit, ServerboundUseItemOn};
+use azalea_registry::HolderSet;
+use azalea_registry::builtin::{EntityKind, ItemKind};
+use glam::{DVec3, Vec3};
+use rustcraft_protocol::wire;
+
+use crate::app::input::{self, InputState};
+use crate::attribute::{AttributeKind, AttributeMap};
+use crate::audio::{AudioEngine, CATEGORY_BLOCKS, CATEGORY_PLAYERS, SoundRef};
+use crate::entity::components::{LookDirection, Position};
+use crate::entity::{EntityStore, living_entity_dimensions};
+use crate::mob_effect::{ActiveMobEffects, MINING_FATIGUE};
+use crate::net::sender::PacketSender;
+use crate::particle::ParticleStore;
+use crate::physics::aabb::{self, Aabb, Axis, Face};
+use crate::physics::block_shape::{self, LocalBox};
+use crate::player::inventory::item_resource_name;
+use crate::position::BlockPos;
+use crate::renderer::pipelines::held_item::{HandRenderSelection, UseAnim};
+use crate::tool::{LegacyMiningEnchantments, stack_tool, sword_instantly_mines_legacy};
+use crate::world::block::BlockStateTable;
+use crate::world::block::block_registry::BlockRegistry;
+use crate::world::block::model::Direction;
+use crate::world::block::render_assets::BlockRenderView;
+use crate::world::block::sound::block_sounds_for_id;
+use crate::world::chunk::ChunkStore;
+
+const DESTROY_COOLDOWN: u32 = 5;
+const MISS_COOLDOWN: u32 = 10;
+const USE_DELAY: u32 = 4;
+const SWING_DURATION: i32 = 6;
+/// Vanilla `Consumable`: no bite effects during the first ~22% of the use,
+/// then a burst every 4 ticks.
+const CONSUME_EFFECTS_START_FRACTION: f32 = 0.21875;
+const CONSUME_EFFECTS_INTERVAL: i32 = 4;
+const MAX_FOOD_LEVEL: u32 = 20;
+
+/// Handles the predicted-break effects need (vanilla level event 2001 spawns
+/// break particles alongside the sound).
+pub struct BreakEffects<'a> {
+    pub particles: &'a mut ParticleStore,
+    pub registry: BlockRenderView<'a>,
+    pub biome_climate: &'a HashMap<u32, crate::renderer::chunk::mesher::BiomeClimate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BlockHitResult {
+    pub block_pos: BlockPos,
+    pub face: Direction,
+    pub hit_point: DVec3,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EntityHitResult {
+    pub entity_id: i32,
+    pub location: DVec3,
+    pub entity_pos: DVec3,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum HitResult {
+    Block(BlockHitResult),
+    Entity(EntityHitResult),
+}
+
+/// Vanilla `InteractionHand.values()`, the order `startUseItem` tries them.
+pub const HANDS: [InteractionHand; 2] = [InteractionHand::MainHand, InteractionHand::OffHand];
+
+/// What one hand holds for a right click: its stack and the block it places.
+#[derive(Debug, Clone, Copy)]
+pub struct HandItem<'a> {
+    pub stack: Option<&'a ItemStackData>,
+    pub place_block: Option<BlockState>,
+    pub worn: Worn<'a>,
+}
+
+/// What a hand's swappable equippable would swap with, vanilla
+/// `Equippable.swapWithEquipmentSlot`'s worn stack.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Worn<'a> {
+    pub stack: Option<&'a ItemStackData>,
+    /// Held by a `prevent_armor_change` enchantment outside creative.
+    pub locked: bool,
+}
+
+/// Vanilla `InteractionResult` as `startUseItem` reads it; `swing` is a
+/// `SwingSource.CLIENT` success.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UseResult {
+    Success { swing: bool },
+    Pass,
+    Fail,
+}
+
+/// Last server-known state for a locally-predicted block change, matching
+/// vanilla `BlockStatePredictionHandler.ServerVerifiedState`.
+struct ServerVerifiedState {
+    seq: u32,
+    state: BlockState,
+    player_pos: DVec3,
+}
+
+/// An in-progress item use (eating/drinking), vanilla
+/// `LivingEntity.useItem` + `useItemRemaining` plus the `Consumable`
+/// component data resolved at start.
+struct ActiveUse {
+    /// Vanilla `LocalPlayer.usingItemHand`.
+    hand: InteractionHand,
+    kind: ItemKind,
+    anim: ItemUseAnimation,
+    /// Bundle entries left to drop, predicted like vanilla's local
+    /// `removeOne`; `None` unless using a bundle.
+    bundle: Option<usize>,
+    sound: SoundRef,
+    has_particles: bool,
+    /// Atlas key for the crumb particles, e.g. `item/cooked_beef`.
+    texture: String,
+    use_effects: UseEffects,
+    duration: i32,
+    /// Counts down from `duration`; vanilla lets it run negative until the
+    /// server completes the use.
+    remaining: i32,
+}
+
+pub struct InteractionState {
+    pub target: Option<HitResult>,
+    seq: u32,
+    carried_slot: u8,
+    last_teleport_seq: u32,
+    pending_predictions: HashMap<BlockPos, ServerVerifiedState>,
+    is_destroying: bool,
+    destroy_pos: BlockPos,
+    /// Held stack captured when the break started, vanilla `destroyingItem`;
+    /// a mid-mine change of item or components restarts the break.
+    destroying_item: Option<ItemStackData>,
+    destroy_progress: f32,
+    destroy_ticks: f32,
+    destroy_delay: u32,
+    miss_time: u32,
+    use_delay: u32,
+    using_item: Option<ActiveUse>,
+    swinging: bool,
+    swinging_arm: InteractionHand,
+    swing_time: i32,
+    attack_anim: f32,
+    o_attack_anim: f32,
+    /// Vanilla `Player.attackStrengthTicker`. The companion `itemSwapTicker`
+    /// (hand-raise animation) is not tracked.
+    attack_strength_ticker: u32,
+    /// Vanilla `Player.lastItemInMainHand`; `None` is the empty hand.
+    last_item_in_main_hand: Option<ItemStackData>,
+}
+
+impl InteractionState {
+    pub fn new() -> Self {
+        Self {
+            target: None,
+            seq: 0,
+            // Vanilla `MultiPlayerGameMode.carriedIndex` starts at 0, the slot
+            // a fresh inventory selects, so a join sends nothing until it
+            // changes.
+            carried_slot: 0,
+            last_teleport_seq: 0,
+            pending_predictions: HashMap::new(),
+            is_destroying: false,
+            destroy_pos: BlockPos {
+                x: -1,
+                y: -1,
+                z: -1,
+            },
+            destroying_item: None,
+            destroy_progress: 0.0,
+            destroy_ticks: 0.0,
+            destroy_delay: 0,
+            miss_time: 0,
+            use_delay: 0,
+            using_item: None,
+            swinging: false,
+            swinging_arm: InteractionHand::MainHand,
+            swing_time: 0,
+            attack_anim: 0.0,
+            o_attack_anim: 0.0,
+            attack_strength_ticker: 0,
+            last_item_in_main_hand: None,
+        }
+    }
+
+    /// Vanilla `retainKnownServerState`: an existing entry only gets its
+    /// sequence bumped, since its stored state is already the server's.
+    fn retain_known_server_state(&mut self, pos: BlockPos, state: BlockState, player_pos: DVec3) {
+        self.pending_predictions
+            .entry(pos)
+            .and_modify(|v| v.seq = self.seq)
+            .or_insert(ServerVerifiedState {
+                seq: self.seq,
+                state,
+                player_pos,
+            });
+    }
+
+    /// Vanilla `updateKnownServerState`: a server block update for a predicted
+    /// position only refreshes the stored state. Returns true if absorbed, in
+    /// which case the caller must not apply the update to the world.
+    pub fn update_known_server_state(&mut self, pos: &BlockPos, state: BlockState) -> bool {
+        if let Some(v) = self.pending_predictions.get_mut(pos) {
+            v.state = state;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn on_teleport(&mut self) {
+        self.last_teleport_seq = self.seq;
+    }
+
+    /// Applies a predicted break locally: remembers the server state for
+    /// rollback, clears the block, and plays the break effects.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_destroy(
+        &mut self,
+        block_registry: &BlockRegistry,
+        pos: BlockPos,
+        state: BlockState,
+        player_pos: DVec3,
+        chunks: &ChunkStore,
+        audio: &AudioEngine,
+        effects: &mut BreakEffects,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) {
+        self.retain_known_server_state(pos, state, player_pos);
+        chunks.set_block_state(
+            pos.x,
+            pos.y,
+            pos.z,
+            BlockState::AIR,
+            block_registry.block_state_table(),
+        );
+        mark_dirty(&pos, dirty_chunks);
+        play_break_sound_for_id(audio, block_registry.block_state_data(state).id(), pos);
+        effects.particles.add_destroy_block_effect(
+            pos,
+            state,
+            effects.registry,
+            chunks,
+            effects.biome_climate,
+        );
+        self.destroy_delay = DESTROY_COOLDOWN;
+    }
+
+    /// Vanilla `endPredictionsUpTo` + `ClientLevel.syncBlockState`: resolves
+    /// every prediction up to `seq` to the server-verified state, so rejected
+    /// breaks pop back instead of desyncing the world. Returns the position to
+    /// snap the player back to when a restored block overlaps them.
+    pub fn acknowledge(
+        &mut self,
+        block_state_table: BlockStateTable,
+        seq: u32,
+        chunks: &ChunkStore,
+        player: Aabb,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) -> Option<DVec3> {
+        let snap_allowed = self.last_teleport_seq < seq;
+        // Keep the lowest block pos among overlapping reverts so the chosen snap
+        // is deterministic (HashMap iteration order is not).
+        let mut snap_to: Option<((i32, i32, i32), DVec3)> = None;
+        self.pending_predictions.retain(|pos, verified| {
+            if verified.seq > seq {
+                return true;
+            }
+            let current = chunks.get_block_state(pos.x, pos.y, pos.z);
+            if current != verified.state {
+                tracing::debug!(
+                    "Server did not confirm block change at {pos:?}, reverting to {:?}",
+                    verified.state
+                );
+                chunks.set_block_state(pos.x, pos.y, pos.z, verified.state, block_state_table);
+                mark_dirty(pos, dirty_chunks);
+                // Full-cube collision, as the engine has no per-shape voxels.
+                if snap_allowed
+                    && block_state_table
+                        .block_state_data(verified.state)
+                        .has_collision()
+                {
+                    let block = Aabb::block(pos.x, pos.y, pos.z);
+                    let key = (pos.x, pos.y, pos.z);
+                    if block.intersects(&player) && snap_to.is_none_or(|(best, _)| key < best) {
+                        snap_to = Some((key, verified.player_pos));
+                    }
+                }
+            }
+            false
+        });
+        snap_to.map(|(_, pos)| pos)
+    }
+
+    pub fn destroy_stage(&self) -> Option<(BlockPos, u32)> {
+        if !self.is_destroying || self.destroy_progress <= 0.0 {
+            return None;
+        }
+        let stage = (self.destroy_progress * 10.0) as u32;
+        Some((self.destroy_pos, stage.min(9)))
+    }
+
+    /// Vanilla `ItemInHandRenderer`'s attack value: `getAttackAnim` for the
+    /// swinging arm's hand, 0 for the other.
+    pub fn swing_progress(&self, hand: InteractionHand, partial_tick: f32) -> f32 {
+        if hand != self.swinging_arm {
+            return 0.0;
+        }
+        let mut diff = self.attack_anim - self.o_attack_anim;
+        if diff < 0.0 {
+            diff += 1.0;
+        }
+        self.o_attack_anim + diff * partial_tick
+    }
+
+    fn start_swing(&mut self, hand: InteractionHand) {
+        if !self.swinging || self.swing_time >= SWING_DURATION / 2 || self.swing_time < 0 {
+            self.swing_time = -1;
+            self.swinging = true;
+            self.swinging_arm = hand;
+        }
+    }
+
+    /// An attack or mining swing, always reported to the server.
+    fn swing(&mut self, sender: &PacketSender) {
+        self.start_swing(InteractionHand::MainHand);
+        send_swing(sender, InteractionHand::MainHand);
+    }
+
+    /// A swing from using an item or entity; see [`send_use_swing`].
+    fn swing_use(&mut self, sender: &PacketSender, hand: InteractionHand) {
+        self.start_swing(hand);
+        send_use_swing(sender, hand);
+    }
+
+    fn update_swing(&mut self) {
+        self.o_attack_anim = self.attack_anim;
+        if self.swinging {
+            self.swing_time += 1;
+            if self.swing_time >= SWING_DURATION {
+                self.swing_time = 0;
+                self.swinging = false;
+            }
+        } else {
+            self.swing_time = 0;
+        }
+        self.attack_anim = self.swing_time as f32 / SWING_DURATION as f32;
+    }
+
+    /// Ports vanilla `LocalPlayer.pick`: block raycast first, entity ray
+    /// truncated at the block hit, the entity wins only if strictly closer.
+    /// An entity hit beyond entity reach is a miss, not a block fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_target(
+        &mut self,
+        block_registry: &BlockRegistry,
+        eye_pos: Position,
+        look_dir: LookDirection,
+        chunks: &ChunkStore,
+        entities: &EntityStore,
+        attributes: &AttributeMap,
+        creative: bool,
+        held_item: Option<&str>,
+    ) {
+        // Vanilla `LocalPlayer.pick`: raycast blocks out to the larger normal
+        // interaction range, then filter the winning hit by its own range.
+        let (block_reach, entity_reach) =
+            interaction_ranges(attributes, creative, block_registry.protocol());
+        let max_dist = block_reach.max(entity_reach);
+
+        let from: DVec3 = eye_pos.into();
+        let dir = look_dir.as_vec();
+        let block_hit = raycast(
+            from,
+            dir,
+            max_dist as f32,
+            chunks,
+            block_registry.block_state_table(),
+            held_item,
+        );
+
+        let block_dist_sq = block_hit
+            .map(|h| h.hit_point.distance_squared(from))
+            .unwrap_or(max_dist * max_dist);
+        let to = from + dir.as_dvec3() * block_dist_sq.sqrt();
+
+        if let Some(hit) = nearest_entity_hit(from, to, entities) {
+            let dist_sq = hit.location.distance_squared(from);
+            if dist_sq < block_dist_sq {
+                self.target =
+                    (dist_sq < entity_reach * entity_reach).then_some(HitResult::Entity(hit));
+                return;
+            }
+        }
+
+        self.target = block_hit
+            .filter(|hit| hit.hit_point.distance_squared(from) < block_reach * block_reach)
+            .map(HitResult::Block);
+    }
+
+    /// Vanilla `MultiPlayerGameMode.tick` + `Minecraft.handleKeybinds`; runs
+    /// before the entity tick, so its packets precede the movement packet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_actions(
+        &mut self,
+        block_registry: &BlockRegistry,
+        input: &InputState,
+        chunks: &ChunkStore,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        player_aabb: Aabb,
+        eye_pos: DVec3,
+        look: LookDirection,
+        on_ground: bool,
+        creative: bool,
+        food: u32,
+        selected_slot: u8,
+        hands: [HandItem; 2],
+        attributes: &AttributeMap,
+        mob_effects: &ActiveMobEffects,
+        eyes_in_water: bool,
+        legacy_mining: LegacyMiningEnchantments,
+        effects: &mut BreakEffects,
+    ) -> Vec<BlockPos> {
+        let mut dirty_chunks = Vec::new();
+        let held_stack = hands[0].stack;
+
+        // Vanilla `Minecraft.tick`: `rightClickDelay` first, then
+        // `gameMode.tick` syncs the carried slot.
+        if self.use_delay > 0 {
+            self.use_delay -= 1;
+        }
+        self.ensure_has_sent_carried_item(sender, selected_slot);
+
+        if !input.is_cursor_captured() {
+            self.stop_destroying(sender);
+            return dirty_chunks;
+        }
+
+        // Vanilla `handleKeybinds` drains attack clicks while an item is in
+        // use, and `continueAttack` early-returns on `isUsingItem`.
+        let using = self.using_item.is_some();
+
+        if !using && input.action_just_pressed(input::Action::Destroy) {
+            self.start_attack(
+                block_registry,
+                chunks,
+                sender,
+                audio,
+                input,
+                player_pos,
+                on_ground,
+                creative,
+                held_stack,
+                attributes,
+                mob_effects,
+                eyes_in_water,
+                legacy_mining,
+                effects,
+                &mut dirty_chunks,
+            );
+        }
+
+        // Vanilla `handleKeybinds`: while an item is in use, holding the use
+        // key continues it and releasing sends RELEASE_USE_ITEM (an early
+        // cancel; consumables finish on the server's own timer, never on
+        // release).
+        if using {
+            if !input.performing_action(input::Action::Use) {
+                self.release_using_item(sender);
+            }
+        } else if input.action_just_pressed(input::Action::Use)
+            || (input.performing_action(input::Action::Use) && self.use_delay == 0)
+        {
+            let success = self.start_use_item(
+                block_registry,
+                sender,
+                audio,
+                chunks,
+                player_pos,
+                player_aabb,
+                eye_pos,
+                look,
+                hands,
+                food,
+                creative,
+                input.performing_action(input::Action::Sneak),
+                effects,
+                &mut dirty_chunks,
+            );
+            if success {
+                let _ = input.weak_rumble_for_instant();
+            }
+        }
+
+        // Vanilla checks `isUsingItem` once before the attack/use/pick loops,
+        // so a use started above does not suppress a pick from the same tick.
+        if !using && input.middle_just_pressed() {
+            self.pick_block_or_entity(sender, input.ctrl_held());
+        }
+
+        let attack_down = input.performing_action(input::Action::Destroy);
+        if !attack_down {
+            self.miss_time = 0;
+        }
+        if self.using_item.is_none() {
+            if attack_down {
+                self.continue_attack(
+                    block_registry,
+                    chunks,
+                    sender,
+                    audio,
+                    player_pos,
+                    on_ground,
+                    creative,
+                    held_stack,
+                    attributes,
+                    mob_effects,
+                    eyes_in_water,
+                    legacy_mining,
+                    effects,
+                    &mut dirty_chunks,
+                );
+            } else {
+                self.stop_destroying(sender);
+            }
+        }
+
+        if self.is_destroying {
+            let _ = input.strong_rumble_for_tick();
+        }
+
+        dirty_chunks
+    }
+
+    /// Post-movement player state: `Player.aiStep` swings after
+    /// `super.aiStep`, still ahead of LocalPlayer's input/movement packets.
+    pub fn tick_player_state(&mut self, cursor_captured: bool, held_stack: Option<&ItemStackData>) {
+        // TODO: vanilla sets missTime = 10000 while a screen is open.
+        if cursor_captured && self.miss_time > 0 {
+            self.miss_time -= 1;
+        }
+        self.tick_attack_cooldown(held_stack);
+        self.update_swing();
+    }
+
+    fn pick_block_or_entity(&self, sender: &PacketSender, include_data: bool) {
+        match self.target {
+            Some(HitResult::Block(hit)) => sender.send_raw(wire::encode_pick_item_from_block(
+                hit.block_pos.x,
+                hit.block_pos.y,
+                hit.block_pos.z,
+                include_data,
+            )),
+            Some(HitResult::Entity(hit)) => {
+                sender.send_raw(wire::encode_pick_item_from_entity(
+                    hit.entity_id,
+                    include_data,
+                ));
+            }
+            None => {}
+        }
+    }
+
+    /// Vanilla `Player.tick`: advance the attack cooldown, and reset it when
+    /// the main-hand item *type* changes; component or count changes only
+    /// refresh the cache.
+    fn tick_attack_cooldown(&mut self, held_stack: Option<&ItemStackData>) {
+        self.attack_strength_ticker = self.attack_strength_ticker.saturating_add(1);
+        // Vanilla `ItemStack.matches`: same item, components, and count.
+        let matches = same_item_same_components(held_stack, self.last_item_in_main_hand.as_ref())
+            && held_stack.map(|s| s.count) == self.last_item_in_main_hand.as_ref().map(|s| s.count);
+        if !matches {
+            let same_type = match (held_stack, &self.last_item_in_main_hand) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.kind == b.kind,
+                _ => false,
+            };
+            if !same_type {
+                self.attack_strength_ticker = 0;
+            }
+            self.last_item_in_main_hand = held_stack.cloned();
+        }
+    }
+
+    /// Vanilla `Player.getAttackStrengthScale(0.0)` (the HUD passes no
+    /// partial tick).
+    pub fn attack_strength_scale(&self, delay: f32) -> f32 {
+        (self.attack_strength_ticker as f32 / delay).clamp(0.0, 1.0)
+    }
+
+    /// Vanilla `Player.cannotAttackWithItem(stack, 0)` (the one call site
+    /// passes no tolerance); the ratio is unclamped, unlike the scale.
+    fn cannot_attack_with_item(
+        &self,
+        held: Option<&ItemStackData>,
+        attributes: &AttributeMap,
+    ) -> bool {
+        let required = held
+            .and_then(stack_component::<MinimumAttackCharge>)
+            .map_or(0.0, |c| c.value);
+        required > 0.0
+            && (self.attack_strength_ticker as f32 / attack_strength_delay(attributes)) < required
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_attack(
+        &mut self,
+        block_registry: &BlockRegistry,
+        chunks: &ChunkStore,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        input: &InputState,
+        player_pos: DVec3,
+        on_ground: bool,
+        creative: bool,
+        held_stack: Option<&ItemStackData>,
+        attributes: &AttributeMap,
+        mob_effects: &ActiveMobEffects,
+        eyes_in_water: bool,
+        legacy_mining: LegacyMiningEnchantments,
+        effects: &mut BreakEffects,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) {
+        if self.miss_time > 0 {
+            return;
+        }
+
+        // TODO: full-charge spears take vanilla's PIERCING_WEAPON branch
+        // instead of the plain entity/block dispatch.
+        if self.cannot_attack_with_item(held_stack, attributes) {
+            return;
+        }
+
+        let hit = match self.target {
+            None => {
+                // Vanilla `Minecraft.startAttack` MISS branch.
+                self.miss_time = MISS_COOLDOWN;
+                self.attack_strength_ticker = 0;
+                self.swing(sender);
+                return;
+            }
+            Some(HitResult::Entity(hit)) => {
+                sender.send_raw(wire::encode_attack(hit.entity_id));
+                self.attack_strength_ticker = 0;
+                self.swing(sender);
+                let _ = input.weak_rumble_for_instant();
+                return;
+            }
+            Some(HitResult::Block(hit)) => hit,
+        };
+
+        let state = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+        if block_registry.block_state_data(state).is_air() {
+            self.miss_time = MISS_COOLDOWN;
+            self.attack_strength_ticker = 0;
+            self.swing(sender);
+            return;
+        }
+
+        self.start_destroy_block(
+            block_registry,
+            hit,
+            chunks,
+            sender,
+            audio,
+            player_pos,
+            on_ground,
+            creative,
+            held_stack,
+            attributes,
+            mob_effects,
+            eyes_in_water,
+            legacy_mining,
+            effects,
+            dirty_chunks,
+        );
+        self.swing(sender);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continue_attack(
+        &mut self,
+        block_registry: &BlockRegistry,
+        chunks: &ChunkStore,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        on_ground: bool,
+        creative: bool,
+        held_stack: Option<&ItemStackData>,
+        attributes: &AttributeMap,
+        mob_effects: &ActiveMobEffects,
+        eyes_in_water: bool,
+        legacy_mining: LegacyMiningEnchantments,
+        effects: &mut BreakEffects,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) {
+        if self.miss_time > 0 {
+            return;
+        }
+
+        // Vanilla `continueAttack` only mines blocks; holding the button over
+        // an entity does not re-attack it.
+        let Some(HitResult::Block(hit)) = self.target else {
+            self.stop_destroying(sender);
+            return;
+        };
+
+        let state = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+        if block_registry.block_state_data(state).is_air() {
+            self.stop_destroying(sender);
+            return;
+        }
+
+        self.continue_destroy_block(
+            block_registry,
+            hit,
+            chunks,
+            sender,
+            audio,
+            player_pos,
+            on_ground,
+            creative,
+            held_stack,
+            attributes,
+            mob_effects,
+            eyes_in_water,
+            legacy_mining,
+            effects,
+            dirty_chunks,
+        );
+        self.swing(sender);
+    }
+
+    /// Vanilla `Minecraft.startUseItem`: each hand in turn tries the target
+    /// and then its own item, stopping at the first success; a failed block
+    /// use stops both. Returns `true` if a hand succeeded.
+    #[allow(clippy::too_many_arguments)]
+    fn start_use_item(
+        &mut self,
+        block_registry: &BlockRegistry,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        chunks: &ChunkStore,
+        player_pos: DVec3,
+        player_aabb: Aabb,
+        eye_pos: DVec3,
+        look: LookDirection,
+        hands: [HandItem; 2],
+        food: u32,
+        creative: bool,
+        sneaking: bool,
+        effects: &mut BreakEffects,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) -> bool {
+        if self.is_destroying {
+            return false;
+        }
+
+        self.use_delay = USE_DELAY;
+
+        // Vanilla `performUseItemOn`: sneaking with anything in either hand
+        // skips the block's own use.
+        let suppress_block_use = sneaking && hands.iter().any(|h| h.stack.is_some());
+        for (hand, held) in HANDS.into_iter().zip(hands) {
+            let result = match self.target {
+                // One interact packet; the server does the rest (trading,
+                // feeding, leads, the villager head-shake).
+                // TODO: succeeding unconditionally is an approximation;
+                // vanilla falls through to `useItem` when the client-side
+                // `interactOn` returns PASS (e.g. eating while the crosshair
+                // rests on a passive mob).
+                Some(HitResult::Entity(hit)) => {
+                    sender.send_raw(wire::encode_interact(
+                        hit.entity_id,
+                        hand as u32,
+                        hit.location - hit.entity_pos,
+                        sneaking,
+                    ));
+                    UseResult::Success { swing: true }
+                }
+                Some(HitResult::Block(hit)) => self.use_item_on(
+                    block_registry,
+                    sender,
+                    chunks,
+                    hit,
+                    hand,
+                    held.place_block,
+                    suppress_block_use,
+                    player_pos,
+                    player_aabb,
+                    dirty_chunks,
+                ),
+                None => UseResult::Pass,
+            };
+            // A passing block use falls through to `useItem`, which is how
+            // eating at the ground works.
+            let result = match (result, held.stack) {
+                (UseResult::Fail, _) => return false,
+                (UseResult::Pass, Some(stack)) => self.use_item(
+                    sender, audio, player_pos, eye_pos, look, hand, stack, held.worn, food,
+                    creative, effects,
+                ),
+                (result, _) => result,
+            };
+            if let UseResult::Success { swing } = result {
+                if swing {
+                    self.swing_use(sender, hand);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Vanilla `MultiPlayerGameMode.useItemOn`: the block's own use (main
+    /// hand only, as `useWithoutItem`) and then the item's placement.
+    #[allow(clippy::too_many_arguments)]
+    fn use_item_on(
+        &mut self,
+        block_registry: &BlockRegistry,
+        sender: &PacketSender,
+        chunks: &ChunkStore,
+        hit: BlockHitResult,
+        hand: InteractionHand,
+        place_block: Option<BlockState>,
+        suppress_block_use: bool,
+        player_pos: DVec3,
+        player_aabb: Aabb,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) -> UseResult {
+        self.seq += 1;
+        sender.send(ServerboundGamePacket::UseItemOn(ServerboundUseItemOn {
+            hand,
+            block_hit: BlockHit {
+                block_pos: hit.block_pos.into(),
+                direction: hit.face.into(),
+                location: azalea_core::position::Vec3::new(
+                    hit.hit_point.x,
+                    hit.hit_point.y,
+                    hit.hit_point.z,
+                ),
+                // TODO: true when the ray started inside the shape, which
+                // scaffolding placement reads.
+                inside: false,
+                world_border: false,
+            },
+            seq: self.seq,
+        }));
+        // TODO: other interactive blocks (brewing stand, dispenser, ...)
+        // should consume the click here too once their menus render.
+        if hand == InteractionHand::MainHand && !suppress_block_use {
+            let target = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+            if opens_menu(block_registry.block_state_data(target).id()) {
+                return UseResult::Success { swing: true };
+            }
+        }
+        // TODO: other `Item.useOn` successes (hoes, flint and steel, bone
+        // meal, ...) pass here and fall through to `useItem`.
+        if place_block.is_none() {
+            return UseResult::Pass;
+        }
+        self.predict_place(
+            block_registry.block_state_table(),
+            hit,
+            place_block,
+            chunks,
+            player_pos,
+            player_aabb,
+            dirty_chunks,
+        );
+        UseResult::Success { swing: true }
+    }
+
+    /// Vanilla `MultiPlayerGameMode.useItem` + `Item.use`: sends
+    /// `ServerboundUseItem` for any held item (the server decides what it
+    /// does) and predicts the result, beginning the local use timer when the
+    /// item is consumable and edible right now.
+    // TODO: item cooldowns, which make vanilla's `useItem` pass.
+    #[allow(clippy::too_many_arguments)]
+    fn use_item(
+        &mut self,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        eye_pos: DVec3,
+        look: LookDirection,
+        hand: InteractionHand,
+        stack: &ItemStackData,
+        worn: Worn,
+        food: u32,
+        creative: bool,
+        effects: &mut BreakEffects,
+    ) -> UseResult {
+        self.seq += 1;
+        sender.send(ServerboundGamePacket::UseItem(ServerboundUseItem {
+            hand,
+            seq: self.seq,
+            y_rot: look.y_rot_deg(),
+            x_rot: look.x_rot_deg(),
+        }));
+
+        // `BundleItem`: a 200-tick use. Its BUNDLE animation is the plain
+        // swing pose, which `None` already draws.
+        if crate::ui::bundle::is_bundle(stack) {
+            if let Some(contents) = crate::ui::bundle::contents(stack) {
+                self.using_item = Some(ActiveUse {
+                    hand,
+                    kind: stack.kind,
+                    anim: ItemUseAnimation::None,
+                    bundle: Some(contents.items.len()),
+                    sound: SoundRef::event("item.bundle.drop_contents"),
+                    has_particles: false,
+                    texture: format!("item/{}", item_resource_name(stack.kind)),
+                    use_effects: stack_component::<UseEffects>(stack).unwrap_or_default(),
+                    duration: 200,
+                    remaining: 200,
+                });
+            }
+            return UseResult::Success { swing: true };
+        }
+
+        let Some(consumable) = stack_component::<Consumable>(stack) else {
+            return item_use_result(stack, worn);
+        };
+        // Vanilla `Consumable.canConsume` → `Player.canEat`: food needs
+        // hunger unless it can always be eaten; creative players (vanilla
+        // invulnerable) always can. Non-food consumables have no gate.
+        if let Some(f) = stack_component::<Food>(stack)
+            && !(creative || f.can_always_eat || food < MAX_FOOD_LEVEL)
+        {
+            return UseResult::Fail;
+        }
+
+        let duration = (consumable.consume_seconds * 20.0) as i32;
+        let active = ActiveUse {
+            hand,
+            kind: stack.kind,
+            anim: consumable.animation,
+            bundle: None,
+            sound: SoundRef::resolve(&consumable.sound),
+            has_particles: consumable.has_consume_particles,
+            texture: format!("item/{}", item_resource_name(stack.kind)),
+            use_effects: stack_component::<UseEffects>(stack).unwrap_or_default(),
+            duration,
+            remaining: duration,
+        };
+        if duration > 0 {
+            self.using_item = Some(active);
+        } else {
+            // Vanilla `Consumable.startConsuming`: a zero-duration consumable
+            // skips the use timer and consumes on the spot (`onConsume`).
+            emit_consume_effects(
+                &active,
+                16,
+                audio,
+                effects.particles,
+                player_pos,
+                eye_pos,
+                look,
+            );
+        }
+        UseResult::Success { swing: false }
+    }
+
+    /// A respawn constructs a fresh LocalPlayer in vanilla. Reset only the
+    /// transient player-owned animation/use state that Rustcraft keeps inside the
+    /// longer-lived interaction controller; block prediction/sequences remain.
+    pub fn reset_player_transients_for_respawn(&mut self) {
+        self.using_item = None;
+        self.swinging = false;
+        self.swinging_arm = InteractionHand::MainHand;
+        self.swing_time = 0;
+        self.attack_anim = 0.0;
+        self.o_attack_anim = 0.0;
+        self.attack_strength_ticker = 0;
+        self.last_item_in_main_hand = None;
+    }
+
+    /// Client `LivingEntity.onSyncedDataUpdated(DATA_LIVING_ENTITY_FLAGS)`:
+    /// when the server clears the using-item bit, discard the local use state
+    /// immediately.
+    pub fn sync_using_item_flag(&mut self, is_using: bool) {
+        // TODO: vanilla also starts a use when the bit turns on with none
+        // active (a server-initiated use); rustcraft only starts uses from its own
+        // UseItem send.
+        if !is_using {
+            self.using_item = None;
+        }
+    }
+
+    /// `LivingEntity.tick` → `updatingUsingItem`, which runs before `aiStep`
+    /// (so before movement), dead or alive: only an already-active use
+    /// advances.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_using_item(
+        &mut self,
+        hand_stacks: [Option<&ItemStackData>; 2],
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        eye_pos: DVec3,
+        look: LookDirection,
+        effects: &mut BreakEffects,
+    ) {
+        self.update_using_item(
+            hand_stacks,
+            sender,
+            audio,
+            player_pos,
+            eye_pos,
+            look,
+            effects,
+        );
+    }
+
+    /// Remaining dead-player `Player.tick` state. Swing animation belongs to
+    /// `Player.aiStep` and therefore stops on the tick-20 removal tick, while
+    /// attack-strength ticking happens after `super.tick` and still advances
+    /// once on that final local-player tick.
+    pub fn tick_dead_player_state(
+        &mut self,
+        held_stack: Option<&ItemStackData>,
+        advance_swing: bool,
+    ) {
+        if advance_swing {
+            self.update_swing();
+        }
+        self.tick_attack_cooldown(held_stack);
+    }
+
+    /// Per-tick item-use heartbeat, vanilla `LivingEntity.updatingUsingItem`
+    /// / `updateUsingItem`: stop silently if the used hand's stack changed,
+    /// emit the periodic bite sound/particles, count the timer down.
+    /// Completion is server-authoritative (entity event 9 →
+    /// `complete_using`); the timer just runs negative until the server
+    /// acts.
+    #[allow(clippy::too_many_arguments)]
+    fn update_using_item(
+        &mut self,
+        hand_stacks: [Option<&ItemStackData>; 2],
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        eye_pos: DVec3,
+        look: LookDirection,
+        effects: &mut BreakEffects,
+    ) {
+        let Some(active) = &self.using_item else {
+            return;
+        };
+        let held_stack = hand_stacks[active.hand as usize];
+        if held_stack.map(|s| s.kind) != Some(active.kind) {
+            self.using_item = None;
+            return;
+        }
+        // `BundleItem.onUseTick`: the first tick, then every other tick after
+        // the tenth, drops one entry (`removeOne`'s sound, `Player.drop`'s
+        // client swing). The server's copy of the stack catches up the count.
+        let drop_tick = active.remaining == active.duration
+            || active.remaining < active.duration - 10 && active.remaining % 2 == 0;
+        if active.bundle.is_some() && drop_tick {
+            let held = held_stack
+                .and_then(crate::ui::bundle::contents)
+                .map_or(0, |c| c.items.len());
+            let dropped = self
+                .using_item
+                .as_mut()
+                .and_then(|a| a.bundle.as_mut())
+                .is_some_and(|left| {
+                    *left = (*left).min(held);
+                    let dropped = *left > 0;
+                    *left = left.saturating_sub(1);
+                    dropped
+                });
+            if dropped {
+                crate::ui::bundle::Sound::RemoveOne.play(audio, player_pos.into());
+                self.swing(sender);
+            }
+        }
+        let Some(active) = &self.using_item else {
+            return;
+        };
+        // `Consumable.shouldEmitParticlesAndSounds`.
+        let elapsed = active.duration - active.remaining;
+        let wait = (active.duration as f32 * CONSUME_EFFECTS_START_FRACTION) as i32;
+        if active.bundle.is_none()
+            && elapsed > wait
+            && active.remaining % CONSUME_EFFECTS_INTERVAL == 0
+        {
+            emit_consume_effects(
+                active,
+                5,
+                audio,
+                effects.particles,
+                player_pos,
+                eye_pos,
+                look,
+            );
+        }
+        if let Some(active) = &mut self.using_item {
+            active.remaining -= 1;
+        }
+    }
+
+    /// Vanilla `MultiPlayerGameMode.releaseUsingItem`: an early release just
+    /// cancels a consume; nothing finishes on release for food.
+    fn release_using_item(&mut self, sender: &PacketSender) {
+        send_action(
+            sender,
+            Action::ReleaseUseItem,
+            BlockPos { x: 0, y: 0, z: 0 },
+            Direction::Down,
+            0,
+        );
+        self.using_item = None;
+    }
+
+    /// Client `LivingEntity.completeUsingItem` (entity event 9) →
+    /// `Consumable.onConsume`: the final 16-crumb burst plus one more consume
+    /// sound. Food, saturation, the burp, and the shrunk stack all arrive as
+    /// separate server packets.
+    pub fn complete_using(
+        &mut self,
+        audio: &AudioEngine,
+        particles: &mut ParticleStore,
+        player_pos: DVec3,
+        eye_pos: DVec3,
+        look: LookDirection,
+    ) {
+        let Some(active) = self.using_item.take() else {
+            return;
+        };
+        // A bundle isn't a `Consumable`: finishing it plays nothing.
+        if active.bundle.is_some() {
+            return;
+        }
+        emit_consume_effects(&active, 16, audio, particles, player_pos, eye_pos, look);
+    }
+
+    /// Vanilla `LocalPlayer.itemUseSpeedMultiplier`: the in-use item's
+    /// `UseEffects` movement-input scale (1.0 when nothing is in use).
+    pub fn use_speed_multiplier(&self) -> f32 {
+        self.using_item
+            .as_ref()
+            .map_or(1.0, |a| a.use_effects.speed_multiplier)
+    }
+
+    /// Vanilla `LocalPlayer.isSlowDueToUsingItem`, which gates sprinting.
+    pub fn slow_due_to_using_item(&self) -> bool {
+        self.using_item
+            .as_ref()
+            .is_some_and(|a| !a.use_effects.can_sprint)
+    }
+
+    /// Which hands first person draws for these held stacks.
+    pub fn hands_to_render(
+        &self,
+        main: Option<&ItemStackData>,
+        off: Option<&ItemStackData>,
+    ) -> HandRenderSelection {
+        let using = self
+            .using_item
+            .as_ref()
+            .map(|active| (active.hand, active.kind));
+        hand_render_selection(main, off, using)
+    }
+
+    /// First-person use-animation state for the held-item renderer, vanilla
+    /// `ItemInHandRenderer.applyEatTransform` inputs. `None` unless `hand`
+    /// is in an eat/drink use with ticks remaining.
+    pub fn use_animation(&self, hand: InteractionHand, partial_tick: f32) -> Option<UseAnim> {
+        let active = self.using_item.as_ref()?;
+        if active.hand != hand
+            || active.remaining <= 0
+            || !matches!(active.anim, ItemUseAnimation::Eat | ItemUseAnimation::Drink)
+        {
+            return None;
+        }
+        Some(UseAnim {
+            curr_usage_time: active.remaining as f32 - partial_tick + 1.0,
+            duration: active.duration as f32,
+        })
+    }
+
+    /// Predicts placement locally for unambiguous single-state blocks,
+    /// mirroring `predict_destroy`: stores air for rollback, writes the
+    /// block, and marks it for remesh. `acknowledge` reverts it if the
+    /// server doesn't confirm. Skips anything not clearly placeable so the
+    /// worst case is just no prediction.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_place(
+        &mut self,
+        block_state_table: BlockStateTable,
+        hit: BlockHitResult,
+        place_block: Option<BlockState>,
+        chunks: &ChunkStore,
+        player_pos: DVec3,
+        player_aabb: Aabb,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) {
+        let Some(state) = place_block else {
+            return;
+        };
+        let pos = hit.block_pos.relative(hit.face);
+
+        // Only predict into an empty cell; replacing grass/water isn't handled yet.
+        if !block_state_table
+            .block_state_data(chunks.get_block_state(pos.x, pos.y, pos.z))
+            .is_air()
+        {
+            return;
+        }
+
+        // Don't predict a solid block overlapping the player; the server denies it.
+        if block_state_table.block_state_data(state).has_collision()
+            && Aabb::block(pos.x, pos.y, pos.z).intersects(&player_aabb)
+        {
+            return;
+        }
+
+        self.retain_known_server_state(pos, BlockState::AIR, player_pos);
+        chunks.set_block_state(pos.x, pos.y, pos.z, state, block_state_table);
+        mark_dirty(&pos, dirty_chunks);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_destroy_block(
+        &mut self,
+        block_registry: &BlockRegistry,
+        hit: BlockHitResult,
+        chunks: &ChunkStore,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        on_ground: bool,
+        creative: bool,
+        held_stack: Option<&ItemStackData>,
+        attributes: &AttributeMap,
+        mob_effects: &ActiveMobEffects,
+        eyes_in_water: bool,
+        legacy_mining: LegacyMiningEnchantments,
+        effects: &mut BreakEffects,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) {
+        let state = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+
+        let block_state_data = block_registry.block_state_data(state);
+        if block_state_data.is_air() {
+            return;
+        }
+
+        // Vanilla `Item.canDestroyBlock`.
+        if creative
+            && held_stack
+                .and_then(|stack| stack_tool(stack, block_registry.protocol()))
+                .is_some_and(|tool| !tool.can_destroy_blocks_in_creative)
+        {
+            self.seq += 1;
+            send_action(
+                sender,
+                Action::StartDestroyBlock,
+                hit.block_pos,
+                hit.face,
+                self.seq,
+            );
+            self.destroy_delay = DESTROY_COOLDOWN;
+            return;
+        }
+
+        let progress = destroy_progress(
+            block_registry,
+            state,
+            on_ground,
+            creative,
+            held_stack,
+            attributes,
+            mob_effects,
+            eyes_in_water,
+            legacy_mining,
+        );
+
+        if progress >= 1.0 {
+            if self.is_destroying {
+                send_action(
+                    sender,
+                    Action::AbortDestroyBlock,
+                    self.destroy_pos,
+                    Direction::Down,
+                    0,
+                );
+                self.is_destroying = false;
+            }
+            self.seq += 1;
+            let seq = self.seq;
+            send_action(
+                sender,
+                Action::StartDestroyBlock,
+                hit.block_pos,
+                hit.face,
+                seq,
+            );
+            self.predict_destroy(
+                block_registry,
+                hit.block_pos,
+                state,
+                player_pos,
+                chunks,
+                audio,
+                effects,
+                dirty_chunks,
+            );
+            return;
+        }
+
+        if self.is_destroying && self.same_destroy_target(hit.block_pos, held_stack) {
+            return;
+        }
+
+        if self.is_destroying {
+            send_action(
+                sender,
+                Action::AbortDestroyBlock,
+                self.destroy_pos,
+                hit.face,
+                0,
+            );
+        }
+
+        self.seq += 1;
+        let seq = self.seq;
+        send_action(
+            sender,
+            Action::StartDestroyBlock,
+            hit.block_pos,
+            hit.face,
+            seq,
+        );
+
+        self.is_destroying = true;
+        self.destroy_pos = hit.block_pos;
+        self.destroying_item = held_stack.cloned();
+        self.destroy_progress = 0.0;
+        self.destroy_ticks = 0.0;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continue_destroy_block(
+        &mut self,
+        block_registry: &BlockRegistry,
+        hit: BlockHitResult,
+        chunks: &ChunkStore,
+        sender: &PacketSender,
+        audio: &AudioEngine,
+        player_pos: DVec3,
+        on_ground: bool,
+        creative: bool,
+        held_stack: Option<&ItemStackData>,
+        attributes: &AttributeMap,
+        mob_effects: &ActiveMobEffects,
+        eyes_in_water: bool,
+        legacy_mining: LegacyMiningEnchantments,
+        effects: &mut BreakEffects,
+        dirty_chunks: &mut Vec<BlockPos>,
+    ) {
+        if self.destroy_delay > 0 {
+            self.destroy_delay -= 1;
+            return;
+        }
+
+        if !self.same_destroy_target(hit.block_pos, held_stack) {
+            self.start_destroy_block(
+                block_registry,
+                hit,
+                chunks,
+                sender,
+                audio,
+                player_pos,
+                on_ground,
+                creative,
+                held_stack,
+                attributes,
+                mob_effects,
+                eyes_in_water,
+                legacy_mining,
+                effects,
+                dirty_chunks,
+            );
+            return;
+        }
+
+        let state = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+        let block_state_data = block_registry.block_state_data(state);
+        if block_state_data.is_air() {
+            self.is_destroying = false;
+            return;
+        }
+
+        self.destroy_progress += destroy_progress(
+            block_registry,
+            state,
+            on_ground,
+            creative,
+            held_stack,
+            attributes,
+            mob_effects,
+            eyes_in_water,
+            legacy_mining,
+        );
+        if self.destroy_ticks % 4.0 == 0.0 {
+            play_hit_sound(audio, block_state_data.id(), hit.block_pos);
+        }
+        self.destroy_ticks += 1.0;
+
+        if self.destroy_progress >= 1.0 {
+            self.seq += 1;
+            let seq = self.seq;
+            send_action(
+                sender,
+                Action::StopDestroyBlock,
+                hit.block_pos,
+                hit.face,
+                seq,
+            );
+            self.predict_destroy(
+                block_registry,
+                hit.block_pos,
+                state,
+                player_pos,
+                chunks,
+                audio,
+                effects,
+                dirty_chunks,
+            );
+            self.is_destroying = false;
+            self.destroy_progress = 0.0;
+            self.destroy_ticks = 0.0;
+        }
+    }
+
+    /// Ports vanilla `MultiPlayerGameMode.ensureHasSentCarriedItem`: tell the
+    /// server which hotbar slot is selected whenever it changes, so it resolves
+    /// interactions against the item we're actually holding.
+    pub fn ensure_has_sent_carried_item(&mut self, sender: &PacketSender, selected_slot: u8) {
+        if selected_slot != self.carried_slot {
+            self.carried_slot = selected_slot;
+            sender.send(ServerboundGamePacket::SetCarriedItem(
+                ServerboundSetCarriedItem {
+                    slot: selected_slot as u16,
+                },
+            ));
+        }
+    }
+
+    /// Vanilla `MultiPlayerGameMode.sameDestroyTarget`: still mining the same
+    /// block with the same item.
+    fn same_destroy_target(&self, pos: BlockPos, held: Option<&ItemStackData>) -> bool {
+        self.destroy_pos == pos && same_item_same_components(held, self.destroying_item.as_ref())
+    }
+
+    pub fn stop_destroying_for_screen(&mut self, sender: &PacketSender) {
+        self.miss_time = 0;
+        self.stop_destroying(sender);
+    }
+
+    fn stop_destroying(&mut self, sender: &PacketSender) {
+        if self.is_destroying {
+            send_action(
+                sender,
+                Action::AbortDestroyBlock,
+                self.destroy_pos,
+                Direction::Down,
+                0,
+            );
+            self.is_destroying = false;
+            self.destroy_progress = 0.0;
+            // Vanilla `MultiPlayerGameMode.stopDestroyBlock`.
+            self.attack_strength_ticker = 0;
+        }
+    }
+}
+
+fn player_attribute(attributes: &AttributeMap, attribute: AttributeKind) -> f64 {
+    attributes
+        .value(attribute)
+        .or_else(|| attribute.player_base_value())
+        .unwrap_or(attribute.definition().default_value)
+}
+
+fn interaction_ranges(attributes: &AttributeMap, creative: bool, protocol: i32) -> (f64, f64) {
+    if protocol <= 765 {
+        // Fixed block/entity pick ranges before the 1.20.5 range attributes.
+        if creative { (5.0, 6.0) } else { (4.5, 3.0) }
+    } else {
+        (
+            player_attribute(attributes, AttributeKind::BlockInteractionRange),
+            player_attribute(attributes, AttributeKind::EntityInteractionRange),
+        )
+    }
+}
+
+/// Vanilla `Player.getCurrentItemAttackStrengthDelay`, in ticks. Equipment
+/// and enchantment modifiers are applied server-side and arrive in the synced
+/// `ATTACK_SPEED` attribute snapshot.
+pub fn attack_strength_delay(attributes: &AttributeMap) -> f32 {
+    let speed = player_attribute(attributes, AttributeKind::AttackSpeed);
+    if speed <= 0.0 {
+        f32::INFINITY
+    } else {
+        (1.0 / speed * 20.0) as f32
+    }
+}
+
+/// Vanilla `ItemStack.isSameItemSameComponents`: item type and components,
+/// never the count. `None` is the empty hand.
+fn same_item_same_components(a: Option<&ItemStackData>, b: Option<&ItemStackData>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.is_same_item_and_components(b),
+        _ => false,
+    }
+}
+
+/// Vanilla `Item.use` past the consumable and bundle cases: the component
+/// uses, then the `Item` subclasses whose use always succeeds.
+// TODO: the conditional subclass uses (buckets, bottles, boats, spawn eggs,
+// eyes of ender, gliding fireworks, items on a stick) and the failures of
+// bows, crossbows, tridents and knowledge books.
+fn item_use_result(stack: &ItemStackData, worn: Worn) -> UseResult {
+    if let Some(equippable) = stack_component::<Equippable>(stack).filter(|e| e.swappable) {
+        return equip_swap_result(&equippable, stack, worn);
+    }
+    if stack_component::<BlocksAttacks>(stack).is_some()
+        || stack_component::<KineticWeapon>(stack).is_some()
+    {
+        return UseResult::Success { swing: false };
+    }
+    match item_resource_name(stack.kind).as_str() {
+        "snowball" | "egg" | "blue_egg" | "brown_egg" | "ender_pearl" | "experience_bottle"
+        | "splash_potion" | "lingering_potion" | "wind_charge" | "fishing_rod"
+        | "writable_book" | "written_book" | "map" | "knowledge_book" => {
+            UseResult::Success { swing: true }
+        }
+        "bow" | "crossbow" | "trident" | "spyglass" | "goat_horn" => {
+            UseResult::Success { swing: false }
+        }
+        _ => UseResult::Pass,
+    }
+}
+
+/// Vanilla `Equippable.swapWithEquipmentSlot` for a player, whose
+/// `canUseSlot` is always true.
+fn equip_swap_result(equippable: &Equippable, stack: &ItemStackData, worn: Worn) -> UseResult {
+    // TODO: a tag of allowed entities is taken to include the player.
+    if let Some(HolderSet::Direct { contents }) = &equippable.allowed_entities
+        && !contents.contains(&EntityKind::Player)
+    {
+        return UseResult::Pass;
+    }
+    if worn.locked
+        || worn
+            .stack
+            .is_some_and(|w| w.is_same_item_and_components(stack))
+    {
+        return UseResult::Fail;
+    }
+    UseResult::Success { swing: true }
+}
+
+/// Whether right-clicking this block opens a menu we render (so the use
+/// click is consumed: no block placement, no item use).
+fn opens_menu(id: &str) -> bool {
+    matches!(
+        id,
+        "crafting_table"
+            | "furnace"
+            | "blast_furnace"
+            | "smoker"
+            | "chest"
+            | "trapped_chest"
+            | "ender_chest"
+            | "barrel"
+    ) || id.ends_with("shulker_box")
+        || id.ends_with("anvil")
+}
+
+/// Vanilla `BlockBehaviour.getDestroyProgress` with `Player.getDestroySpeed`
+/// as the numerator: the held tool's mining speed over hardness, divided by 30
+/// with the correct tool for drops and 100 without.
+#[allow(clippy::too_many_arguments)]
+fn destroy_progress(
+    block_registry: &BlockRegistry,
+    state: BlockState,
+    on_ground: bool,
+    creative: bool,
+    held_stack: Option<&ItemStackData>,
+    attributes: &AttributeMap,
+    mob_effects: &ActiveMobEffects,
+    eyes_in_water: bool,
+    legacy_mining: LegacyMiningEnchantments,
+) -> f32 {
+    if creative {
+        return 1.0;
+    }
+    let block_state_data = block_registry.block_state_data(state);
+    let block_data = block_registry.block(state).block_data();
+    let tags = block_registry.tags();
+    let protocol = block_registry.protocol();
+    let block_name = block_state_data.id();
+    if held_stack
+        .is_some_and(|stack| sword_instantly_mines_legacy(stack.kind, block_name, protocol))
+    {
+        return 1.0;
+    }
+    let hardness = block_data.destroy_time;
+
+    if hardness < 0.0 {
+        return 0.0;
+    }
+    if hardness == 0.0 {
+        return 1.0;
+    }
+
+    let tool = held_stack.and_then(|stack| stack_tool(stack, protocol));
+    let speed = destroy_speed(
+        tool.as_deref()
+            .map_or(1.0, |tool| tool.mining_speed(block_name, tags)),
+        on_ground,
+        attributes,
+        mob_effects,
+        eyes_in_water,
+        protocol,
+        legacy_mining,
+    );
+
+    let correct_tool = !block_data.requires_correct_tool_for_drops
+        || tool
+            .as_deref()
+            .is_some_and(|tool| tool.correct_for_drops(block_name, tags, protocol));
+    let divisor = if correct_tool { 30.0 } else { 100.0 };
+    speed / hardness / divisor
+}
+
+/// Vanilla 26.2 `Player.getDestroySpeed` modifier chain after the held
+/// `Tool` component has supplied its base speed for the targeted block.
+fn destroy_speed(
+    mut speed: f32,
+    on_ground: bool,
+    attributes: &AttributeMap,
+    mob_effects: &ActiveMobEffects,
+    eyes_in_water: bool,
+    protocol: i32,
+    legacy_mining: LegacyMiningEnchantments,
+) -> f32 {
+    if speed > 1.0 {
+        if protocol <= 766 {
+            if legacy_mining.efficiency > 0 {
+                speed += (legacy_mining.efficiency * legacy_mining.efficiency + 1) as f32;
+            }
+        } else {
+            speed += player_attribute(attributes, AttributeKind::MiningEfficiency) as f32;
+        }
+    }
+
+    if let Some(amplifier) = mob_effects.dig_speed_amplifier() {
+        speed *= 1.0 + (amplifier + 1) as f32 * 0.2;
+    }
+
+    if let Some(amplifier) = mob_effects.amplifier(MINING_FATIGUE) {
+        speed *= match amplifier {
+            0 => 0.3,
+            1 => 0.09,
+            2 => 0.0027,
+            _ => 0.00081,
+        };
+    }
+
+    if protocol >= 766 {
+        speed *= player_attribute(attributes, AttributeKind::BlockBreakSpeed) as f32;
+    }
+    if eyes_in_water {
+        if protocol <= 766 {
+            if !legacy_mining.aqua_affinity {
+                speed /= 5.0;
+            }
+        } else {
+            speed *= player_attribute(attributes, AttributeKind::SubmergedMiningSpeed) as f32;
+        }
+    }
+    if !on_ground {
+        speed /= 5.0;
+    }
+    speed
+}
+
+/// Plays a block's mining hit sound, matching vanilla
+/// `MultiPlayerGameMode.continueDestroyBlock`: volume `(volume + 1) / 8`, pitch
+/// `pitch * 0.5`.
+fn play_hit_sound(audio: &AudioEngine, id: &str, pos: BlockPos) {
+    let s = block_sounds_for_id(id);
+    play_block_sound(
+        audio,
+        &s.hit_event,
+        pos,
+        (s.volume + 1.0) / 8.0,
+        s.pitch * 0.5,
+    );
+}
+
+/// Plays a block's break sound, matching vanilla `LevelEventHandler` event
+/// 2001: volume `(volume + 1) / 2`, pitch `pitch * 0.8`.
+pub(crate) fn play_break_sound_for_id(audio: &AudioEngine, id: &str, pos: BlockPos) {
+    let s = block_sounds_for_id(id);
+    play_block_sound(
+        audio,
+        &s.break_event,
+        pos,
+        (s.volume + 1.0) / 2.0,
+        s.pitch * 0.8,
+    );
+}
+
+/// Vanilla `ItemInHandRenderer.evaluateWhichHandsToRender` and
+/// `selectionUsingItemWhileHoldingBowLike`, plus `submitArmWithItem`'s
+/// `isScoping` early return, which hides both hands. `using` is the used hand
+/// and item while an item use is active.
+fn hand_render_selection(
+    main: Option<&ItemStackData>,
+    off: Option<&ItemStackData>,
+    using: Option<(InteractionHand, ItemKind)>,
+) -> HandRenderSelection {
+    if using.is_some_and(|(_, kind)| kind == ItemKind::Spyglass) {
+        return HandRenderSelection::NONE;
+    }
+    let holds = |kind| [main, off].iter().flatten().any(|s| s.kind == kind);
+    if !holds(ItemKind::Bow) && !holds(ItemKind::Crossbow) {
+        return HandRenderSelection::BOTH;
+    }
+    if let Some((hand, kind)) = using {
+        if matches!(kind, ItemKind::Bow | ItemKind::Crossbow) {
+            return match hand {
+                InteractionHand::MainHand => HandRenderSelection::MAIN_ONLY,
+                InteractionHand::OffHand => HandRenderSelection::OFF_ONLY,
+            };
+        }
+        return if hand == InteractionHand::MainHand && off.is_some_and(is_charged_crossbow) {
+            HandRenderSelection::MAIN_ONLY
+        } else {
+            HandRenderSelection::BOTH
+        };
+    }
+    if main.is_some_and(is_charged_crossbow) {
+        return HandRenderSelection::MAIN_ONLY;
+    }
+    HandRenderSelection::BOTH
+}
+
+/// Vanilla `ItemInHandRenderer.isChargedCrossbow` / `CrossbowItem.isCharged`.
+pub(crate) fn is_charged_crossbow(stack: &ItemStackData) -> bool {
+    stack.kind == ItemKind::Crossbow
+        && stack_component::<ChargedProjectiles>(stack).is_some_and(|c| !c.items.is_empty())
+}
+
+/// The stack's component override if the server set one, else the item's
+/// default.
+fn stack_component<T: DefaultableComponent + Clone>(stack: &ItemStackData) -> Option<T> {
+    stack
+        .component_patch
+        .get::<T>()
+        .cloned()
+        .or_else(|| get_default_component::<T>(stack.kind))
+}
+
+/// Vanilla `Consumable.emitParticlesAndSounds`: the shared bite / final-gulp
+/// burst of item crumbs plus the consume sound. The sound plays locally here
+/// and again from the server's broadcast, doubling up for the eater exactly
+/// like vanilla (MC-98310).
+fn emit_consume_effects(
+    active: &ActiveUse,
+    particle_count: u32,
+    audio: &AudioEngine,
+    particles: &mut ParticleStore,
+    player_pos: DVec3,
+    eye_pos: DVec3,
+    look: LookDirection,
+) {
+    if active.has_particles {
+        particles.add_item_use_particles(
+            particle_count,
+            &active.texture,
+            eye_pos,
+            look.x_rot_deg(),
+            look.y_rot_deg(),
+        );
+    }
+    let (volume, pitch) = if matches!(active.anim, ItemUseAnimation::Drink) {
+        (0.5, 0.9 + fastrand::f32() * 0.1)
+    } else {
+        (
+            if fastrand::bool() { 0.5 } else { 1.0 },
+            1.0 + 0.2 * (fastrand::f32() - fastrand::f32()),
+        )
+    };
+    audio.play_world_sound(
+        &active.sound,
+        CATEGORY_PLAYERS,
+        Position::new(player_pos.x, player_pos.y, player_pos.z),
+        volume,
+        pitch,
+        fastrand::u64(..),
+    );
+}
+
+/// Plays a block sound event at the block centre in the BLOCKS category with a
+/// random variant. No-op for an empty event (a silent `SoundType` slot).
+fn play_block_sound(audio: &AudioEngine, event: &str, pos: BlockPos, volume: f32, pitch: f32) {
+    if event.is_empty() {
+        return;
+    }
+    audio.play_world_sound(
+        &SoundRef::event(event),
+        CATEGORY_BLOCKS,
+        Position::new(pos.x as f64 + 0.5, pos.y as f64 + 0.5, pos.z as f64 + 0.5),
+        volume,
+        pitch,
+        fastrand::u64(..),
+    );
+}
+
+/// Record an edited block. The caller (`core::dirty_sections_for_block`)
+/// expands it into the affected 16³ sections, including neighbour
+/// sections/columns when the block is on a boundary.
+fn mark_dirty(pos: &BlockPos, dirty: &mut Vec<BlockPos>) {
+    if !dirty.contains(pos) {
+        dirty.push(*pos);
+    }
+}
+
+/// `held_item` is the main-hand item id, which some outlines depend on.
+pub fn raycast(
+    origin: DVec3,
+    dir: Vec3,
+    max_dist: f32,
+    chunks: &ChunkStore,
+    block_state_table: BlockStateTable,
+    held_item: Option<&str>,
+) -> Option<BlockHitResult> {
+    let dir = dir.as_dvec3();
+    let mut bx = origin.x.floor() as i32;
+    let mut by = origin.y.floor() as i32;
+    let mut bz = origin.z.floor() as i32;
+
+    let step_x = if dir.x > 0.0 { 1 } else { -1 };
+    let step_y = if dir.y > 0.0 { 1 } else { -1 };
+    let step_z = if dir.z > 0.0 { 1 } else { -1 };
+
+    let t_delta_x = if dir.x != 0.0 {
+        (1.0 / dir.x).abs()
+    } else {
+        f64::INFINITY
+    };
+    let t_delta_y = if dir.y != 0.0 {
+        (1.0 / dir.y).abs()
+    } else {
+        f64::INFINITY
+    };
+    let t_delta_z = if dir.z != 0.0 {
+        (1.0 / dir.z).abs()
+    } else {
+        f64::INFINITY
+    };
+
+    let mut t_max_x = if dir.x > 0.0 {
+        (bx as f64 + 1.0 - origin.x) * t_delta_x
+    } else {
+        (origin.x - bx as f64) * t_delta_x
+    };
+    let mut t_max_y = if dir.y > 0.0 {
+        (by as f64 + 1.0 - origin.y) * t_delta_y
+    } else {
+        (origin.y - by as f64) * t_delta_y
+    };
+    let mut t_max_z = if dir.z > 0.0 {
+        (bz as f64 + 1.0 - origin.z) * t_delta_z
+    } else {
+        (origin.z - bz as f64) * t_delta_z
+    };
+
+    let reach_end = origin + dir * max_dist as f64;
+    let mut t = 0.0_f64;
+    while t <= max_dist as f64 {
+        let state = chunks.get_block_state(bx, by, bz);
+        let block_state_data = block_state_table.block_state_data(state);
+        if !block_state_data.is_air() {
+            let block_pos = BlockPos {
+                x: bx,
+                y: by,
+                z: bz,
+            };
+            let outline = block_shape::outline_shape_holding_data(block_state_data, held_item);
+            let shape_offset = block_state_data.outline_shape_position(bx, by, bz);
+            if let Some((hit_point, face)) = clip_shape(origin, reach_end, shape_offset, outline) {
+                return Some(BlockHitResult {
+                    block_pos,
+                    face,
+                    hit_point,
+                });
+            }
+        }
+        if t_max_x < t_max_y && t_max_x < t_max_z {
+            t = t_max_x;
+            t_max_x += t_delta_x;
+            bx += step_x;
+        } else if t_max_y < t_max_z {
+            t = t_max_y;
+            t_max_y += t_delta_y;
+            by += step_y;
+        } else {
+            t = t_max_z;
+            t_max_z += t_delta_z;
+            bz += step_z;
+        }
+    }
+    None
+}
+
+/// Ports vanilla `ProjectileUtil.getEntityHitResult`: clips the ray against
+/// each entity's bounding box and keeps the nearest hit. A box containing the
+/// ray origin counts as distance zero.
+fn nearest_entity_hit(from: DVec3, to: DVec3, entities: &EntityStore) -> Option<EntityHitResult> {
+    let mut nearest_dist_sq = f64::MAX;
+    let mut nearest = None;
+    for (&entity_id, entity) in &entities.living {
+        let dims = living_entity_dimensions(entity);
+        let aabb = dims.make_bounding_box(entity.position.into());
+
+        let (location, dist_sq) = if aabb.contains(from) {
+            (from, 0.0)
+        } else if let Some(clip) = aabb.clip(from, to) {
+            (clip, clip.distance_squared(from))
+        } else {
+            continue;
+        };
+
+        if dist_sq < nearest_dist_sq {
+            nearest_dist_sq = dist_sq;
+            nearest = Some(EntityHitResult {
+                entity_id,
+                location,
+                entity_pos: entity.position.into(),
+            });
+        }
+    }
+    nearest
+}
+
+/// How far along the ray vanilla `VoxelShape.clip` probes to decide whether it
+/// started inside the shape.
+const INSIDE_PROBE_FRACTION: f64 = 0.001;
+
+/// Ports vanilla `VoxelShape.clip`: a ray starting inside the shape hits it at
+/// the probe point, otherwise the nearest box entry wins. An empty shape is
+/// never hit, so the caller walks on to the next block. Vanilla's
+/// degenerate-ray guard is dropped; `raycast` always passes a scaled unit
+/// direction.
+fn clip_shape(
+    from: DVec3,
+    to: DVec3,
+    offset: DVec3,
+    boxes: &[LocalBox],
+) -> Option<(DVec3, Direction)> {
+    if boxes.is_empty() {
+        return None;
+    }
+    let ray = to - from;
+    let probe = from + ray * INSIDE_PROBE_FRACTION;
+
+    let starts_inside = boxes
+        .iter()
+        .any(|&b| Aabb::from_local(b, offset).contains(probe));
+    if starts_inside {
+        return Some((probe, Direction::approximate_nearest(ray).opposite()));
+    }
+
+    let (t, face) = aabb::clip_boxes(boxes, offset, from, to)?;
+    Some((from + ray * t, face_direction(face)))
+}
+
+/// Vanilla `AABB.getDirection`: a ray entering a box's min face on an axis is
+/// travelling positive along it, so the face it hit points back the other way.
+fn face_direction(face: Face) -> Direction {
+    match (face.axis, face.max) {
+        (Axis::X, false) => Direction::West,
+        (Axis::X, true) => Direction::East,
+        (Axis::Y, false) => Direction::Down,
+        (Axis::Y, true) => Direction::Up,
+        (Axis::Z, false) => Direction::North,
+        (Axis::Z, true) => Direction::South,
+    }
+}
+
+fn send_action(
+    sender: &PacketSender,
+    action: Action,
+    pos: BlockPos,
+    direction: Direction,
+    seq: u32,
+) {
+    sender.send(ServerboundGamePacket::PlayerAction(
+        ServerboundPlayerAction {
+            action,
+            pos: pos.into(),
+            direction: direction.into(),
+            seq,
+        },
+    ));
+}
+
+/// Reports a swing from using an item, block or entity where the wire
+/// version does (`Translation::reports_use_swings`).
+pub(crate) fn send_use_swing(sender: &PacketSender, hand: InteractionHand) {
+    if crate::net::translate::active().is_none_or(|t| t.reports_use_swings()) {
+        send_swing(sender, hand);
+    }
+}
+
+pub(crate) fn send_swing(sender: &PacketSender, hand: InteractionHand) {
+    use azalea_protocol::packets::game::s_swing::ServerboundSwing;
+    sender.send(ServerboundGamePacket::Swing(ServerboundSwing { hand }));
+}
+
+/// Q / Ctrl+Q, vanilla `LocalPlayer.drop`'s player-action packet.
+pub(crate) fn send_drop(sender: &PacketSender, whole_stack: bool) {
+    let action = if whole_stack {
+        Action::DropAllItems
+    } else {
+        Action::DropItem
+    };
+    send_action(sender, action, BlockPos::default(), Direction::Down, 0);
+}
+
+/// F, vanilla `Minecraft.handleKeybinds`' offhand swap.
+pub(crate) fn send_swap_offhand(sender: &PacketSender) {
+    send_action(
+        sender,
+        Action::SwapItemWithOffhand,
+        BlockPos::default(),
+        Direction::Down,
+        0,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::dvec3;
+    use rustcraft_protocol::version::NATIVE;
+
+    use super::*;
+    use crate::attribute::AttributeSnapshot;
+    use crate::mob_effect::{CONDUIT_POWER, HASTE, MobEffectInstance};
+    use crate::world::block::{BlockTags, block_tags_for_test};
+
+    #[test]
+    fn carried_slot_starts_at_vanilla_zero_and_only_sends_on_change() {
+        use crate::net::sender::Outbound;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = PacketSender::new(tx);
+        let mut state = InteractionState::new();
+
+        state.ensure_has_sent_carried_item(&sender, 0);
+        assert!(rx.try_recv().is_err());
+
+        state.ensure_has_sent_carried_item(&sender, 5);
+        let Outbound::Packet(packet) = rx.try_recv().expect("slot change packet") else {
+            panic!("expected structured packet");
+        };
+        let ServerboundGamePacket::SetCarriedItem(packet) = *packet else {
+            panic!("expected SetCarriedItem");
+        };
+        assert_eq!(packet.slot, 5);
+    }
+
+    #[test]
+    fn hand_render_selection_matches_vanilla() {
+        use azalea_inventory::ItemStack;
+
+        let stack = |kind| ItemStackData::new(kind, 1);
+        let charged = ItemStack::new(ItemKind::Crossbow, 1)
+            .with_component(ChargedProjectiles {
+                items: vec![ItemStack::new(ItemKind::Arrow, 1)],
+            })
+            .as_present()
+            .cloned()
+            .unwrap();
+        let (stone, bow, crossbow, totem) = (
+            stack(ItemKind::Stone),
+            stack(ItemKind::Bow),
+            stack(ItemKind::Crossbow),
+            stack(ItemKind::TotemOfUndying),
+        );
+        let main = InteractionHand::MainHand;
+        let off = InteractionHand::OffHand;
+        let cases = [
+            (&stone, &totem, None, HandRenderSelection::BOTH),
+            (&charged, &totem, None, HandRenderSelection::MAIN_ONLY),
+            (&crossbow, &totem, None, HandRenderSelection::BOTH),
+            (&stone, &charged, None, HandRenderSelection::BOTH),
+            (
+                &stone,
+                &charged,
+                Some((main, ItemKind::Apple)),
+                HandRenderSelection::MAIN_ONLY,
+            ),
+            (
+                &stone,
+                &bow,
+                Some((off, ItemKind::Bow)),
+                HandRenderSelection::OFF_ONLY,
+            ),
+            (
+                &bow,
+                &totem,
+                Some((main, ItemKind::Bow)),
+                HandRenderSelection::MAIN_ONLY,
+            ),
+            (
+                &stack(ItemKind::Spyglass),
+                &totem,
+                Some((main, ItemKind::Spyglass)),
+                HandRenderSelection::NONE,
+            ),
+        ];
+        for (i, (main, off, using, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                hand_render_selection(Some(main), Some(off), using),
+                expected,
+                "case {i}"
+            );
+        }
+    }
+
+    fn eating_apple(hand: InteractionHand) -> ActiveUse {
+        ActiveUse {
+            hand,
+            kind: ItemKind::Apple,
+            anim: ItemUseAnimation::Eat,
+            bundle: None,
+            sound: SoundRef::event("entity.generic.eat"),
+            has_particles: true,
+            texture: "item/apple".to_string(),
+            use_effects: UseEffects::default(),
+            duration: 32,
+            remaining: 12,
+        }
+    }
+
+    #[test]
+    fn only_the_swinging_arm_swings() {
+        let mut state = InteractionState::new();
+        state.start_swing(InteractionHand::OffHand);
+        state.update_swing();
+        state.update_swing();
+        assert!(state.swing_progress(InteractionHand::OffHand, 1.0) > 0.0);
+        assert_eq!(state.swing_progress(InteractionHand::MainHand, 1.0), 0.0);
+    }
+
+    #[test]
+    fn only_the_used_hand_animates() {
+        let mut state = InteractionState::new();
+        state.using_item = Some(eating_apple(InteractionHand::OffHand));
+        assert!(state.use_animation(InteractionHand::OffHand, 0.0).is_some());
+        assert!(
+            state
+                .use_animation(InteractionHand::MainHand, 0.0)
+                .is_none()
+        );
+    }
+
+    /// Vanilla `Item.use`: a plain item passes so the other hand gets a go;
+    /// throwables swing, shields and bows start a use without one; armor
+    /// fails when the same piece is worn or the worn one is bound.
+    #[test]
+    fn item_use_results_follow_item_use() {
+        let result = |kind| item_use_result(&ItemStackData::new(kind, 1), Worn::default());
+        assert_eq!(result(ItemKind::Stone), UseResult::Pass);
+        assert_eq!(
+            result(ItemKind::Snowball),
+            UseResult::Success { swing: true }
+        );
+        assert_eq!(
+            result(ItemKind::Shield),
+            UseResult::Success { swing: false }
+        );
+        assert_eq!(result(ItemKind::Bow), UseResult::Success { swing: false });
+        assert_eq!(
+            result(ItemKind::DiamondHelmet),
+            UseResult::Success { swing: true }
+        );
+
+        let helmet = ItemStackData::new(ItemKind::IronHelmet, 1);
+        let worn = |stack, locked| Worn {
+            stack: Some(stack),
+            locked,
+        };
+        let other = ItemStackData::new(ItemKind::GoldenHelmet, 1);
+        assert_eq!(
+            item_use_result(&helmet, worn(&helmet, false)),
+            UseResult::Fail
+        );
+        assert_eq!(
+            item_use_result(&helmet, worn(&other, true)),
+            UseResult::Fail
+        );
+        assert_eq!(
+            item_use_result(&helmet, worn(&other, false)),
+            UseResult::Success { swing: true }
+        );
+    }
+
+    #[test]
+    fn respawn_resets_player_owned_interaction_transients() {
+        let mut state = InteractionState::new();
+        state.swinging = true;
+        state.swing_time = 4;
+        state.attack_anim = 0.8;
+        state.o_attack_anim = 0.6;
+        state.attack_strength_ticker = 7;
+        state.last_item_in_main_hand = Some(ItemStackData::new(ItemKind::Stone, 1));
+        state.using_item = Some(eating_apple(InteractionHand::MainHand));
+
+        state.reset_player_transients_for_respawn();
+
+        assert!(!state.swinging);
+        assert_eq!(state.swing_time, 0);
+        assert_eq!(state.attack_anim, 0.0);
+        assert_eq!(state.o_attack_anim, 0.0);
+        assert_eq!(state.attack_strength_ticker, 0);
+        assert!(state.last_item_in_main_hand.is_none());
+        assert!(state.using_item.is_none());
+    }
+
+    #[test]
+    fn synced_using_item_flag_clears_server_stopped_use() {
+        let mut state = InteractionState::new();
+        state.using_item = Some(eating_apple(InteractionHand::MainHand));
+
+        state.sync_using_item_flag(true);
+        assert!(state.using_item.is_some());
+        state.sync_using_item_flag(false);
+        assert!(state.using_item.is_none());
+    }
+
+    #[test]
+    fn dead_player_heartbeat_stops_swing_on_removal_tick_but_not_attack_cooldown() {
+        let mut state = InteractionState::new();
+        state.swinging = true;
+        state.swing_time = 0;
+        state.attack_strength_ticker = 0;
+
+        state.tick_dead_player_state(None, true);
+        assert_eq!(state.swing_time, 1);
+        assert_eq!(state.attack_strength_ticker, 1);
+
+        state.tick_dead_player_state(None, false);
+        assert_eq!(
+            state.swing_time, 1,
+            "Player.aiStep must be skipped on the tick-20 removal tick"
+        );
+        assert_eq!(
+            state.attack_strength_ticker, 2,
+            "Player.tick state after super.tick still advances once on the removal tick"
+        );
+    }
+
+    /// Vanilla `isSameItemSameComponents`: count never matters, the item type
+    /// does, and the empty hand only matches itself.
+    #[test]
+    fn item_comparison_ignores_count() {
+        let a = ItemStackData::new(ItemKind::Stone, 1);
+        assert!(same_item_same_components(
+            Some(&a),
+            Some(&ItemStackData::new(ItemKind::Stone, 64))
+        ));
+        assert!(!same_item_same_components(
+            Some(&a),
+            Some(&ItemStackData::new(ItemKind::Dirt, 1))
+        ));
+        assert!(!same_item_same_components(Some(&a), None));
+        assert!(same_item_same_components(None, None));
+    }
+
+    #[test]
+    fn pick_dispatches_current_target_and_ignores_miss() {
+        use crate::net::sender::Outbound;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = PacketSender::new(tx);
+        let mut interaction = InteractionState::new();
+
+        interaction.target = Some(HitResult::Block(BlockHitResult {
+            block_pos: BlockPos::new(-1, 64, 3),
+            face: Direction::North,
+            hit_point: DVec3::ZERO,
+        }));
+        interaction.pick_block_or_entity(&sender, true);
+        match rx.try_recv().expect("block pick packet") {
+            Outbound::Raw(bytes) => {
+                assert_eq!(bytes, wire::encode_pick_item_from_block(-1, 64, 3, true))
+            }
+            _ => panic!("pick packet must use raw encoding"),
+        }
+
+        interaction.target = Some(HitResult::Entity(EntityHitResult {
+            entity_id: 300,
+            location: DVec3::ZERO,
+            entity_pos: DVec3::ZERO,
+        }));
+        interaction.pick_block_or_entity(&sender, false);
+        match rx.try_recv().expect("entity pick packet") {
+            Outbound::Raw(bytes) => {
+                assert_eq!(bytes, wire::encode_pick_item_from_entity(300, false));
+            }
+            _ => panic!("pick packet must use raw encoding"),
+        }
+
+        interaction.target = None;
+        interaction.pick_block_or_entity(&sender, false);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn ray_over_partial_block_misses_but_ray_onto_it_hits() {
+        let slab_height = 0.5;
+        let block = DVec3::ZERO;
+        let bottom_slab: [LocalBox; 1] = [[0.0, 0.0, 0.0, 1.0, slab_height, 1.0]];
+        let origin = dvec3(-1.0, 1.5, 0.5);
+
+        let over_the_slab = origin + dvec3(4.0, -1.4, 0.0);
+        let slab_hit = clip_shape(origin, over_the_slab, block, &bottom_slab);
+        assert!(slab_hit.is_none());
+
+        let onto_the_slab = origin + dvec3(3.0, -2.75, 0.0);
+        let (hit_point, face) = clip_shape(origin, onto_the_slab, block, &bottom_slab).unwrap();
+        let tolerance = 1e-9;
+        let is_on_slab_surface = (hit_point.y - slab_height).abs() < tolerance;
+        assert!(is_on_slab_surface, "hit {hit_point:?}");
+        assert_eq!(face, Direction::Up);
+    }
+
+    /// Vanilla `VoxelShape.clip` reports the inside case at the probe point,
+    /// not at the ray's origin.
+    #[test]
+    fn ray_starting_inside_partial_block_hits_immediately() {
+        let block = DVec3::ZERO;
+        let bottom_slab: [LocalBox; 1] = [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]];
+        let inside_the_slab = dvec3(0.5, 0.25, 0.5);
+        let ray = dvec3(0.0, -4.0, 0.0);
+
+        let (hit_point, face) =
+            clip_shape(inside_the_slab, inside_the_slab + ray, block, &bottom_slab).unwrap();
+        assert_eq!(hit_point, inside_the_slab + ray * INSIDE_PROBE_FRACTION);
+        assert_eq!(face, Direction::Up);
+    }
+
+    /// Vanilla clips straight through an empty shape (`LiquidBlock.getShape`),
+    /// so the caller walks on to the block behind it.
+    #[test]
+    fn ray_passes_through_an_empty_shape() {
+        let block = DVec3::ZERO;
+        let from = dvec3(0.5, 2.0, 0.5);
+        assert!(clip_shape(from, from + dvec3(0.0, -4.0, 0.0), block, &[]).is_none());
+    }
+
+    fn set_attribute(attributes: &mut AttributeMap, attribute: AttributeKind, base: f64) {
+        assert!(attributes.apply_snapshot(&AttributeSnapshot {
+            attribute,
+            base,
+            modifiers: vec![],
+        }));
+    }
+
+    fn effects(entries: &[(u32, i32)]) -> ActiveMobEffects {
+        let mut effects = ActiveMobEffects::default();
+        for &(effect_id, amplifier) in entries {
+            effects.update(MobEffectInstance {
+                effect_id,
+                amplifier,
+                duration: 200,
+                ambient: false,
+                show_icon: true,
+            });
+        }
+        effects
+    }
+
+    /// `destroy_speed` on the ground, dry, on the native protocol.
+    fn native_speed(speed: f32, attributes: &AttributeMap, effects: &ActiveMobEffects) -> f32 {
+        destroy_speed(
+            speed,
+            true,
+            attributes,
+            effects,
+            false,
+            NATIVE.protocol,
+            LegacyMiningEnchantments::default(),
+        )
+    }
+
+    #[test]
+    fn attack_delay_uses_synced_attack_speed_attribute() {
+        let mut attributes = AttributeMap::player();
+        set_attribute(&mut attributes, AttributeKind::AttackSpeed, 1.6);
+        assert_eq!(attack_strength_delay(&attributes), 12.5);
+    }
+
+    #[test]
+    fn destroy_speed_matches_vanilla_modifier_order() {
+        let mut attributes = AttributeMap::player();
+        set_attribute(&mut attributes, AttributeKind::MiningEfficiency, 3.0);
+        set_attribute(&mut attributes, AttributeKind::BlockBreakSpeed, 2.0);
+        let effects = effects(&[(HASTE, 1), (MINING_FATIGUE, 0)]);
+
+        // (6 + 3) * haste 1.4 * fatigue 0.3 * break 2 * submerged 0.2 / airborne 5
+        let speed = destroy_speed(
+            6.0,
+            false,
+            &attributes,
+            &effects,
+            true,
+            NATIVE.protocol,
+            LegacyMiningEnchantments::default(),
+        );
+        assert!((speed - 0.3024).abs() < 1.0e-6, "speed={speed}");
+    }
+
+    #[test]
+    fn mining_efficiency_only_applies_when_tool_speed_exceeds_one() {
+        let mut attributes = AttributeMap::player();
+        set_attribute(&mut attributes, AttributeKind::MiningEfficiency, 100.0);
+        let effects = ActiveMobEffects::default();
+
+        assert_eq!(native_speed(1.0, &attributes, &effects), 1.0);
+        assert_eq!(native_speed(2.0, &attributes, &effects), 102.0);
+    }
+
+    #[test]
+    fn conduit_power_uses_same_dig_speed_multiplier_as_haste() {
+        let effects = effects(&[(CONDUIT_POWER, 2)]);
+        assert_eq!(native_speed(2.0, &AttributeMap::player(), &effects), 3.2);
+    }
+
+    #[test]
+    fn legacy_mining_uses_direct_efficiency_and_aqua_affinity() {
+        let mut attributes = AttributeMap::player();
+        set_attribute(&mut attributes, AttributeKind::BlockBreakSpeed, 2.0);
+        let effects = ActiveMobEffects::default();
+        let legacy = LegacyMiningEnchantments {
+            efficiency: 3,
+            aqua_affinity: false,
+        };
+
+        // (6 + 3^2 + 1) * break 2 / underwater 5
+        assert_eq!(
+            destroy_speed(6.0, true, &attributes, &effects, true, 766, legacy),
+            6.4
+        );
+        assert_eq!(
+            destroy_speed(
+                6.0,
+                true,
+                &attributes,
+                &effects,
+                true,
+                766,
+                LegacyMiningEnchantments {
+                    aqua_affinity: true,
+                    ..legacy
+                },
+            ),
+            32.0
+        );
+        // 1.20.4 predates BLOCK_BREAK_SPEED.
+        assert_eq!(
+            destroy_speed(6.0, true, &attributes, &effects, false, 765, legacy),
+            16.0
+        );
+    }
+
+    #[test]
+    fn legacy_creative_entity_reach_is_preserved_before_range_attributes() {
+        let attributes = AttributeMap::player();
+        assert_eq!(interaction_ranges(&attributes, false, 765), (4.5, 3.0));
+        assert_eq!(interaction_ranges(&attributes, true, 765), (5.0, 6.0));
+        assert_eq!(
+            interaction_ranges(&attributes, true, NATIVE.protocol),
+            (4.5, 3.0)
+        );
+    }
+
+    fn seed_standard_tool_tags(
+        block_state_table: BlockStateTable,
+    ) -> (BlockTags, Vec<(String, Vec<i32>)>) {
+        let entries: &[(&str, &[&str])] = &[
+            ("mineable/pickaxe", &["stone"]),
+            ("mineable/shovel", &["dirt"]),
+            ("mineable/axe", &["oak_log"]),
+            ("mineable/hoe", &["hay_block"]),
+            ("incorrect_for_wooden_tool", &[]),
+            ("incorrect_for_stone_tool", &[]),
+            ("incorrect_for_copper_tool", &[]),
+            ("incorrect_for_iron_tool", &[]),
+            ("incorrect_for_diamond_tool", &[]),
+            ("incorrect_for_gold_tool", &[]),
+            ("incorrect_for_netherite_tool", &[]),
+            ("sword_instantly_mines", &[]),
+            ("sword_efficient", &[]),
+        ];
+        let tags = block_tags_for_test(block_state_table, entries);
+        let names: Vec<_> = (0..)
+            .map_while(|id| block_state_table.registry_name(id))
+            .collect();
+        let raw_tags = entries
+            .iter()
+            .map(|(tag, blocks)| {
+                let ids = blocks
+                    .iter()
+                    .map(|block| names.iter().position(|name| name == block).unwrap() as i32)
+                    .collect();
+                (format!("minecraft:{tag}"), ids)
+            })
+            .collect();
+        (tags, raw_tags)
+    }
+
+    #[test]
+    fn runtime_destroy_progress_differs_by_tool() {
+        let block_state_table = BlockStateTable::native();
+        let (_, tags) = seed_standard_tool_tags(block_state_table);
+        let stone = block_state_table
+            .first_state_of("stone")
+            .expect("stone state");
+        let mut block_registry = BlockRegistry::native();
+        block_registry.replace_tags(tags);
+        let attributes = AttributeMap::player();
+        let effects = ActiveMobEffects::default();
+        let progress = |kind: Option<ItemKind>| {
+            let stack = kind.map(|kind| ItemStackData::new(kind, 1));
+            destroy_progress(
+                &block_registry,
+                stone,
+                true,
+                false,
+                stack.as_ref(),
+                &attributes,
+                &effects,
+                false,
+                LegacyMiningEnchantments::default(),
+            )
+        };
+        let hand_progress = progress(None);
+        let wooden_progress = progress(Some(ItemKind::WoodenPickaxe));
+        let iron_progress = progress(Some(ItemKind::IronPickaxe));
+
+        assert!(hand_progress < wooden_progress);
+        assert!(wooden_progress < iron_progress);
+    }
+
+    #[test]
+    fn standard_pickaxe_tiers_match_vanilla_26_2_speeds() {
+        let (tags, _) = seed_standard_tool_tags(BlockStateTable::native());
+        for (kind, expected) in [
+            (ItemKind::WoodenPickaxe, 2.0),
+            (ItemKind::StonePickaxe, 4.0),
+            (ItemKind::CopperPickaxe, 5.0),
+            (ItemKind::IronPickaxe, 6.0),
+            (ItemKind::DiamondPickaxe, 8.0),
+            (ItemKind::GoldenPickaxe, 12.0),
+            (ItemKind::NetheritePickaxe, 9.0),
+        ] {
+            let stack = ItemStackData::new(kind, 1);
+            let tool =
+                stack_tool(&stack, NATIVE.protocol).expect("pickaxe has a native tool component");
+            assert_eq!(tool.mining_speed("stone", &tags), expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn standard_tool_families_use_native_block_tags() {
+        let (tags, _) = seed_standard_tool_tags(BlockStateTable::native());
+        for (item, block_name, expected) in [
+            (ItemKind::IronPickaxe, "stone", 6.0),
+            (ItemKind::IronShovel, "dirt", 6.0),
+            (ItemKind::IronAxe, "oak_log", 6.0),
+            (ItemKind::IronHoe, "hay_block", 6.0),
+            (ItemKind::IronSword, "cobweb", 15.0),
+        ] {
+            let stack = ItemStackData::new(item, 1);
+            let tool = stack_tool(&stack, NATIVE.protocol)
+                .expect("standard tool has a native tool component");
+            assert_eq!(tool.mining_speed(block_name, &tags), expected, "{item:?}");
+        }
+    }
+
+    #[test]
+    fn iron_pickaxe_default_tool_uses_native_tags() {
+        let (tags, _) = seed_standard_tool_tags(BlockStateTable::native());
+        let pickaxe = ItemStackData::new(ItemKind::IronPickaxe, 1);
+        let tool = stack_tool(&pickaxe, NATIVE.protocol)
+            .expect("iron pickaxe has a native tool component");
+        assert_eq!(tool.mining_speed("stone", &tags), 6.0);
+        assert!(tool.correct_for_drops("stone", &tags, NATIVE.protocol));
+        assert_eq!(tool.mining_speed("dirt", &tags), 1.0);
+        assert!(!tool.correct_for_drops("dirt", &tags, NATIVE.protocol));
+    }
+}

@@ -1,0 +1,11 @@
+Rustcraft - A Minecraft Client
+
+Created by: WeakzzyTech
+
+Based on PommeMC
+
+Original authors from PommeMC:
+- Purdze (upstream author)
+
+This client is a fork of the Pomme Minecraft client.
+The project has been renamed from Pomme to Rustcraft.

@@ -1,0 +1,69 @@
+# Titles and a boss bar arrive from the server, update and clear.
+
+[[step]]
+wait_ms = 2000
+
+[[step]]
+chat = "/title @a times 10 400 10"
+
+[[step]]
+chat = "/title @a subtitle \"sub\""
+
+[[step]]
+chat = "/title @a title \"Hello\""
+
+[[step]]
+expect = { hud = { title = "Hello", subtitle = "sub" } }
+
+[[step]]
+chat = "/bossbar add rustcraft:test \"Test Bar\""
+
+[[step]]
+chat = "/bossbar set rustcraft:test players @a"
+
+[[step]]
+chat = "/bossbar set rustcraft:test value 50"
+
+[[step]]
+expect = { hud = { boss_bars = ["Test Bar"] } }
+
+# Past the title's fade-in and the bar's progress lerp.
+[[step]]
+wait_ms = 500
+
+[[step]]
+screenshot = "title_and_boss_bar"
+
+[[step]]
+chat = "/bossbar set rustcraft:test name \"Renamed\""
+
+[[step]]
+expect = { hud = { boss_bars = ["Renamed"] } }
+
+[[step]]
+chat = "/title @a clear"
+
+[[step]]
+expect = { hud = { title = "" } }
+
+[[step]]
+screenshot = "renamed_boss_bar"
+
+[[step]]
+chat = "/bossbar remove rustcraft:test"
+
+[[step]]
+expect = { hud = { boss_bars = [] } }
+
+# Vanilla's font decomposes legacy codes in every string, not only chat.
+[[step]]
+chat = "/title @a title \"\\u00a7cRed \\u00a7lBold\""
+
+[[step]]
+wait_ms = 500
+
+[[step]]
+screenshot = "legacy_codes"
+
+[[step]]
+chat = "/title @a reset"

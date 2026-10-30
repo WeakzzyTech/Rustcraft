@@ -1,0 +1,128 @@
+[package]
+name = "rustcraft-client"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[features]
+default = ["singleplayer"]
+# Embeds SteelMC as the integrated server. Off, the world screens still list and
+# edit saves but nothing can open one.
+singleplayer = ["dep:rustcraft-singleplayer"]
+# Loads `ttf` font providers from resource packs through the system FreeType
+# (pkg-config). Off, those providers are skipped.
+ttf-fonts = ["dep:freetype-rs"]
+# Headless CPU benchmarks (`just bench`): `--cpu-bench [filter]` runs criterion
+# over the mesher, fade rebuild and occlusion walk, then exits.
+cpu-bench = ["dep:criterion"]
+# Debug test harness (`just ingame-test`, tests/ingame/README.md): drives the client
+# from scripts or a localhost socket. Never enabled in release builds.
+test-harness = ["dep:toml"]
+
+[build-dependencies]
+flate2 = "1"
+shaderc = "0.10"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.34"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha1_smol = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+rsa = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+zip = { workspace = true }
+tokio = { workspace = true, features = ["tracing", "net", "time"] }
+reqwest = { workspace = true, features = ["blocking"] }
+pyronyx = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+tracing-appender = "0.2"
+# Shader packs: GLSL parsed and rewritten in Rust, then compiled to SPIR-V.
+# naga 30's `glsl-in` doesn't build without `wgsl-in`.
+glsl-lang = { version = "0.8.1", features = ["lexer-full"] }
+naga = { version = "30.0.1", features = ["glsl-in", "wgsl-in", "spv-out"] }
+# Per-thread-heap allocator: the chunk-mesh worker pool churns vertex/index Vecs
+# across threads, and the default system heap's global lock serializes that and
+# stalls the main thread. Mirrors vanilla (JVM TLABs + LWJGL's jemalloc).
+mimalloc = "0.1"
+# `mi_option_set`, to return freed memory sooner (lib.rs).
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+rustcraft-gpu-allocator = { path = "../rustcraft-gpu-allocator" }
+rustcraft-dirs = { path = "../rustcraft-dirs" }
+rustcraft-protocol = { path = "../rustcraft-protocol" }
+rustcraft-install = { path = "../rustcraft-install" }
+rustcraft-singleplayer = { path = "../rustcraft-singleplayer", optional = true }
+winit = { version = "0.30", features = ["rwh_06"] }
+raw-window-handle = "0.6"
+glam = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.13"
+bytemuck = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+flate2 = "1"
+azalea-buf = "0.16"
+# `connecting` and `online-mode` only gate azalea's own connection type, which
+# rustcraft replaced with net::conn; authentication goes straight to azalea-auth.
+azalea-protocol = { version = "0.16", default-features = false }
+azalea-crypto = "0.16"
+azalea-auth = "0.16"
+azalea-entity = "0.16"
+azalea-block = "0.16"
+azalea-chat = "0.16"
+# azalea-core uses bevy_ecs without gating it on its feature; azalea-world
+# used to turn both of these on.
+azalea-core = { version = "0.16", features = ["bevy_ecs", "serde"] }
+azalea-registry = "0.16"
+azalea-inventory = "0.16"
+uuid = { version = "1", features = ["v4"] }
+md-5 = "0.11"
+crossbeam-channel = "0.5"
+png = "0.17"
+toml = { version = "1", optional = true }
+image = "0.25"
+fontdue = "0.9.3"
+freetype-rs = { version = "0.38", optional = true }
+simdnbt = "0.10"
+scopeguard = "1.2"
+libloading = "0.9"
+open = { workspace = true }
+discord-rich-presence = "1.1"
+criterion = { version = "=0.8.2", default-features = false, optional = true }
+symphonia = { version = "0.5.5", default-features = false, features = ["ogg", "vorbis"] }
+fastrand = "2"
+gilrs = "0.11.2"
+
+# arboard has no Android or iOS backend; pyronyx's window-handle helpers don't
+# compile for Android and have no iOS arm (see
+# `renderer::rhi::vulkan::context::window_surface`).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+pyronyx = { workspace = true, features = ["rwh_06"] }
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+# Android has no OS credential store for rustcraft-auth (see `account::store`).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustcraft-auth = { path = "../rustcraft-auth", features = ["keyring"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+raw-window-metal = "1.1"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-ui-kit = "0.3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustcraft-auth = { path = "../rustcraft-auth" }
+jni = "0.22"
+winit = { version = "0.30", features = ["android-native-activity"] }
+paranoid-android = "0.2"
+
+[dev-dependencies]
+rustcraft-protocol = { path = "../rustcraft-protocol", features = ["vanilla-fixtures"] }
