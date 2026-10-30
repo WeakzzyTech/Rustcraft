@@ -919,7 +919,7 @@ impl Translation {
             login_hello_bare: protocol <= 765,
             login_hello_optional_uuid: (protocol <= 763)
                 .then(|| required_id(native, Phase::Login, Direction::Serverbound, "hello")),
-            login_session_pad: protocol <= 775,
+            login_session_pad: protocol <= 777,
             v775: (protocol <= 775).then(|| Ids775 {
                 game_login_id: id(Phase::Game, "login"),
                 set_player_team_id: id(Phase::Game, "set_player_team"),
