@@ -32,11 +32,26 @@ Get Rustcraft from the [latest release](https://github.com/RustcraftMC/Client/re
 - **Windows x64**: `rustcraft-client-windows-x64-setup.exe`
 - **macOS (Apple Silicon)**: `rustcraft-client-macos-arm64.dmg`, then drag Rustcraft to Applications
 - **Linux x64**: `rustcraft-client-linux-x64-gnu.AppImage`
+- **Android (ARM64)**: Build from source via `adb install ./target/...` or see [BUILDING.md](./BUILDING.md)
+- **iOS**: Build from source via Xcode; see [BUILDING.md](./BUILDING.md)
 
-It plays offline by default, using `Steve` or the name passed with
-`--username`, and keeps itself up to date. Signing in with a Microsoft account
-is optional; online-mode servers require it. The builds aren't signed yet, so
-the first launch needs one extra step, described in the release notes.
+It plays offline by default. On first run, a `local` account is automatically created and selected. You can also add additional local accounts via the launcher's **Add Account** dialog, or pass `--username <name>` directly on the command line. Microsoft sign-in is optional; online-mode servers require it. The builds aren't signed yet, so the first launch needs one extra step, described in the release notes.
+
+### Local accounts
+
+- A `local` account is auto-created on first launch and selected by default
+- Click **Add** in the account dropdown to create additional local accounts with custom names
+- Local accounts play offline: the client derives the same vanilla offline UUID (`MD5("OfflinePlayer:<name>")`), so worlds/servers treat you consistently
+- Removing the last local account re-creates `local`, so the launcher always has a default
+- Microsoft sign-in remains a separate option for online-mode servers
+
+### Releases per platform
+
+- **Windows x64**: Installer (`setup.exe`) — includes JRE bundling, start menu shortcut, and auto-update support
+- **macOS (Apple Silicon)**: DMG disk image — drag-and-drop application, verified signature pending
+- **Linux x64**: AppImage — single executable, no installation needed, works on most modern distros
+- **Android (ARM64)**: Source-only; build with `adb` or see [BUILDING.md](./BUILDING.md) for full instructions
+- **iOS**: Source-only; build with Xcode; see [BUILDING.md](./BUILDING.md) for full instructions
 
 Early Android and iOS builds build from source: see [BUILDING.md](./BUILDING.md).
 
