@@ -8,18 +8,13 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="GPL-3.0 license"></a>
   </p>
   <p align="center">
-    <a href="#download"><b>Download</b></a> · <a href="https://discord.gg/ucBA55bHPR"><b>Discord</b></a> · <a href="./BUILDING.md"><b>Build from source</b></a> · <a href="./CONTRIBUTING.md"><b>Contributing</b></a>
+    <a href="#download"><b>Download</b></a> · <a href="./BUILDING.md"><b>Build from source</b></a> · <a href="./CONTRIBUTING.md"><b>Contributing</b></a>
   </p>
 </p>
 
 ---
 
 Rustcraft contains no Mojang code, and joins vanilla servers from 1.20 through 26.3.
-
-> [!NOTE]
-> Rustcraft is a fork of the [Pomme client](https://github.com/PommeMC/Client).
-> The original project and its copyright belong to the Pomme authors; this fork
-> renames the project and continues development independently.
 
 <p align="center">
   <img width="100%" alt="Rustcraft flying over a jungle" src="https://github.com/user-attachments/assets/c35e717e-3535-4f4f-9539-9e62dd482e04" />
@@ -67,7 +62,7 @@ Early Android and iOS builds build from source: see [BUILDING.md](./BUILDING.md)
 
 > [!WARNING]
 > Rustcraft is in active development. Expect missing features and bugs, and please
-> report them in [Issues](https://github.com/RustcraftMC/Client/issues) or on Discord.
+> report them in [Issues](https://github.com/RustcraftMC/Client/issues).
 
 ## Features
 
@@ -120,18 +115,6 @@ Minecraft is a trademark of Mojang Studios.
 
 ## Community
 
-[![Discord](https://img.shields.io/discord/1483578136544280618?color=5865F2&label=Discord&logo=discord&logoColor=white)](https://discord.gg/ucBA55bHPR)
-[![Sponsor](https://img.shields.io/badge/Sponsor-Purdze-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Purdze)
+Rustcraft is an independent fork of the Pomme Minecraft client.
 
-<details>
-<summary>Star history</summary>
-
-<a href="https://www.star-history.com/?repos=RustcraftMC%2FClient&type=date&logscale=&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=RustcraftMC/Client&type=date&theme=dark&logscale&legend=top-left&sealed_token=r7ib_n7xrIE4aUaRqlz9KCFjr5-Cpocxw6LPtk06-CcFfxLAEjzgPfz5bSzzGcSnbhRnkbN6KwRem4jwXnRJzcsuZYIZX5tyIAmYKFIc60c_2HBXRhGHA4rlvmyr2MXfeZDe2thqz-maf8Tdh5FxHAWJUFflGQP1JjoIfbyUZ0GW6pMxxJ8qfga5eta0" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=RustcraftMC/Client&type=date&logscale&legend=top-left&sealed_token=r7ib_n7xrIE4aUaRqlz9KCFjr5-Cpocxw6LPtk06-CcFfxLAEjzgPfz5bSzzGcSnbhRnkbN6KwRem4jwXnRJzcsuZYIZX5tyIAmYKFIc60c_2HBXRhGHA4rlvmyr2MXfeZDe2thqz-maf8Tdh5FxHAWJUFflGQP1JjoIfbyUZ0GW6pMxxJ8qfga5eta0" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=RustcraftMC/Client&type=date&logscale&legend=top-left&sealed_token=r7ib_n7xrIE4aUaRqlz9KCFjr5-Cpocxw6LPtk06-CcFfxLAEjzgPfz5bSzzGcSnbhRnkbN6KwRem4jwXnRJzcsuZYIZX5tyIAmYKFIc60c_2HBXRhGHA4rlvmyr2MXfeZDe2thqz-maf8Tdh5FxHAWJUFflGQP1JjoIfbyUZ0GW6pMxxJ8qfga5eta0" />
- </picture>
-</a>
-
-</details>
+[![Star History Chart](https://api.star-history.com/chart?repos=RustcraftMC%2FClient&type=date&logscale=&legend=top-left)]
