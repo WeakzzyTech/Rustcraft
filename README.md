@@ -115,8 +115,6 @@ Minecraft is a trademark of Mojang Studios.
 
 ## Community
 
-Rustcraft is an independent client, built from scratch in Rust and Vulkan.
-It plays offline by default with a `local` account, and supports Microsoft
-sign-in for online-mode servers.
+Rustcraft is an independent client, built from scratch in Rust and Vulkan, and is a fork of the Pomme MC project.
 
 [![Star History Chart](https://api.star-history.com/chart?repos=RustcraftMC%2FClient&type=date&logscale=&legend=top-left)]
